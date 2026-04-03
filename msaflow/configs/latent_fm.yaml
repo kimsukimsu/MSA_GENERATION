@@ -1,0 +1,34 @@
+# MSAFlow Latent FM Encoder training configuration
+# Matches paper Section 6.8.2: 130M params, 15 epochs, 4×H200, LR 2.6e-4
+
+model:
+  msa_dim: 128            # AF3 compressed MSA embedding dim (input/output)
+  esm_dim: 1280           # ESM2-650M embedding dim
+  hidden_size: 768        # DiT hidden dim
+  depth: 12               # Number of transformer blocks
+  num_heads: 12           # Attention heads
+  mlp_ratio: 4.0
+  max_seq_len: 1024
+
+data:
+  lmdb_path: /data/msaflow.lmdb
+  max_seq_len: 1024
+  batch_size: 32          # Per-GPU; paper uses 32768 max total tokens
+  num_workers: 4
+
+training:
+  epochs: 15
+  lr: 2.6e-4
+  weight_decay: 0.1
+  warmup_steps: 3000
+  max_grad_norm: 1.0
+  grad_accumulation: 1
+  seed: 42
+  output_dir: /runs/latent_fm
+  resume: true
+  log_every: 100
+  ema_decay: 0.9999
+  use_ema: true
+  mixed_precision: "bf16"
+  use_wandb: false
+  wandb_project: msaflow

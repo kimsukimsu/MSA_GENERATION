@@ -1,0 +1,35 @@
+# MSAFlow SFM Decoder training configuration
+# Matches paper Section 6.8.2: 129M params, 7 epochs, 4×H200, LR 1e-5
+
+model:
+  vocab_size: 22          # 20 AA + gap + X
+  msa_dim: 128            # AF3 compressed MSA embedding dim
+  hidden_size: 768        # DiT hidden dim
+  depth: 12               # Number of transformer blocks
+  num_heads: 12           # Attention heads
+  mlp_ratio: 4.0
+  max_seq_len: 1024
+
+data:
+  lmdb_path: /data/msaflow.lmdb
+  n_seqs_per_msa: 32      # Sequences sampled per MSA (paper: 32)
+  max_seq_len: 1024
+  batch_size: 4           # Per-GPU batch (number of MSAs)
+  num_workers: 4
+
+training:
+  epochs: 7
+  lr: 1.0e-5
+  weight_decay: 0.1
+  warmup_steps: 5000
+  max_grad_norm: 1.0
+  grad_accumulation: 1
+  seed: 42
+  output_dir: /runs/decoder
+  resume: true
+  log_every: 100
+  ema_decay: 0.9999
+  use_ema: true
+  mixed_precision: "bf16"
+  use_wandb: false
+  wandb_project: msaflow
