@@ -199,14 +199,14 @@ def _score_from_velocity(
 ) -> torch.Tensor:
     """Convert velocity prediction to score s_θ = ∇ log p(z_t|e, t).
 
-    For the rectified flow, the score can be approximated as:
-        s_θ(z_t, t) ≈ −v_θ(z_t, t) / (t·(1−t))
+    For the rectified flow z_t = (1−t)·z_1 + t·z_0, the score is:
+        s_θ(z_t, t) = −(v_θ·(1−t) + z_t) / t
 
-    This approximation comes from the relationship between the score and the
+    This follows from the relationship between the score and the
     velocity field in the probability-flow ODE.
     """
-    denom = (t * (1.0 - t)).clamp(min=eps)
-    return -v / denom.view(-1, 1, 1)
+    denom = t.clamp(min=eps)
+    return -(v * (1.0 - t).view(-1, 1, 1) + z_t) / denom.view(-1, 1, 1)
 
 
 @torch.no_grad()

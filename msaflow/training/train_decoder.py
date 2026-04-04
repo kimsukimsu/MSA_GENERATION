@@ -97,7 +97,8 @@ def train(cfg):
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
+        format="%(asctime)s  [ %(name)s ]  %(message)s",
+        datefmt="%Y-%m-%d %H:%M",
     )
 
     # ── Model ────────────────────────────────────────────────────────────────
@@ -112,7 +113,8 @@ def train(cfg):
     )
     n_params = sum(p.numel() for p in model.parameters())
     if accelerator.is_main_process:
-        logger.info("SFM decoder: %.1fM parameters", n_params / 1e6)
+        logger.info("SFM decoder  ----- %.1fM params  depth=%d  hidden=%d  vocab=%d",
+                     n_params / 1e6, cfg.model.depth, cfg.model.hidden_size, cfg.model.vocab_size)
 
     ema = EMA(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
 
@@ -122,6 +124,8 @@ def train(cfg):
         n_seqs_per_msa=cfg.data.n_seqs_per_msa,
         max_seq_len=cfg.data.max_seq_len,
     )
+    if accelerator.is_main_process:
+        logger.info("Dataset loaded  ----- %d entries", len(dataset))
     loader = DataLoader(
         dataset,
         batch_size=cfg.data.batch_size,
@@ -170,11 +174,20 @@ def train(cfg):
     )
 
     # ── Optional wandb ────────────────────────────────────────────────────────
-    if accelerator.is_main_process and cfg.training.get("use_wandb", False):
+    use_wandb = cfg.training.get("use_wandb", False)
+    if accelerator.is_main_process and use_wandb:
         import wandb
         wandb.init(project=cfg.training.wandb_project, config=OmegaConf.to_container(cfg))
+        wandb.watch(
+            accelerator.unwrap_model(model),
+            log="gradients",
+            log_freq=cfg.training.log_every,
+        )
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    if accelerator.is_main_process:
+        logger.info("Training started  ----- total_steps=%d  epochs=%d  lr=%.2e",
+                     total_steps, cfg.training.epochs, cfg.training.lr)
     for epoch in range(start_epoch, cfg.training.epochs):
         model.train()
         epoch_loss = 0.0
@@ -195,7 +208,7 @@ def train(cfg):
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
 
                 optimizer.step()
                 scheduler.step()
@@ -215,9 +228,15 @@ def train(cfg):
                     "epoch %d | step %d | loss %.4f | lr %.2e",
                     epoch, global_step, loss.item(), lr,
                 )
-                if cfg.training.get("use_wandb", False):
+                if use_wandb:
                     import wandb
-                    wandb.log({"train/loss": loss.item(), "train/lr": lr}, step=global_step)
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/lr": lr,
+                        "train/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+                        "train/epoch": epoch,
+                        "train/batch_idx": batch_idx,
+                    }, step=global_step)
 
         # ── Checkpoint ───────────────────────────────────────────────────────
         if accelerator.is_main_process:
@@ -233,11 +252,20 @@ def train(cfg):
                 ckpt["ema"] = ema.state_dict()
             torch.save(ckpt, output_dir / "latest.pt")
             torch.save(ckpt, output_dir / f"epoch_{epoch:03d}.pt")
+            avg_loss = epoch_loss.item() / len(loader)
             logger.info(
                 "Epoch %d complete | avg loss %.4f",
                 epoch,
-                epoch_loss.item() / len(loader),
+                avg_loss,
             )
+            logger.info("-" * 60)
+            if use_wandb:
+                import wandb
+                wandb.log({
+                    "epoch/avg_loss": avg_loss,
+                    "epoch/epoch_num": epoch,
+                    "epoch/learning_rate": scheduler.get_last_lr()[0],
+                }, step=global_step)
 
     if accelerator.is_main_process:
         logger.info("Training complete.")
@@ -246,6 +274,9 @@ def train(cfg):
             unwrapped = accelerator.unwrap_model(model)
             ema.copy_to(unwrapped)
             torch.save({"model": unwrapped.state_dict()}, output_dir / "decoder_ema_final.pt")
+        if use_wandb:
+            import wandb
+            wandb.finish()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

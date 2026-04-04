@@ -167,7 +167,7 @@ def sample_sphere_noise(shape: tuple, device=None, dtype=torch.float32) -> torch
         x: (*shape) unit-sphere points with positive components.
     """
     # Sample Dirichlet(1) = Uniform on simplex, then map to sphere
-    noise = torch.rand(*shape, device=device, dtype=dtype).clamp(min=1e-8)
+    noise = -torch.log(torch.rand(*shape, device=device, dtype=dtype).clamp(min=1e-8))
     mu = noise / noise.sum(dim=-1, keepdim=True)   # normalise to simplex
     return simplex_to_sphere(mu)
 
@@ -202,13 +202,13 @@ def decode_sequences(x1: torch.Tensor, temperature: float = 1.0) -> torch.Tensor
 
     Args:
         x1:          (..., L, V) final sphere points.
-        temperature: sampling temperature (1.0 = argmax, >1 = diverse).
+        temperature: sampling temperature (0 = argmax, 1.0 = unmodified, >1 = diverse).
 
     Returns:
         tokens: (..., L) integer token ids.
     """
     mu = sphere_to_simplex(x1)      # (..., L, V) probabilities
-    if temperature <= 0.0 or temperature == 1.0:
+    if temperature <= 0.0:
         return mu.argmax(dim=-1)
     logits = torch.log(mu.clamp(min=1e-8)) / temperature
     return torch.distributions.Categorical(logits=logits).sample()
