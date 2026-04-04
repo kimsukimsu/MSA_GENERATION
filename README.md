@@ -53,26 +53,32 @@ Shallow/Deep MSA ──► AF3 MSAModule ──► Compress ──► SFM Decode
 ```
 msaflow/
 ├── configs/
-│   ├── decoder.yaml           # SFM decoder training config
-│   ├── latent_fm.yaml         # Latent FM training config
-│   └── accelerate_4gpu.yaml   # Distributed training config
+│   ├── decoder.yaml             # SFM decoder training config
+│   ├── latent_fm.yaml           # Latent FM training config
+│   ├── accelerate_2gpu.yaml     # 2-GPU distributed training config
+│   └── accelerate_4gpu.yaml     # 4-GPU distributed training config
 ├── data/
-│   ├── dataset.py             # MSADecoderDataset, LatentFMDataset
-│   └── preprocessing.py       # LMDB builder (Protenix + ESM2 embeddings)
+│   ├── dataset.py               # MSADecoderDataset, LatentFMDataset
+│   └── preprocessing.py         # LMDB builder (Protenix + ESM2 embeddings)
 ├── models/
-│   ├── sfm_decoder.py         # SFM decoder (DiT + position-wise AdaLN)
-│   └── latent_fm.py           # Latent FM encoder + SDE sampler
+│   ├── sfm_decoder.py           # SFM decoder (DiT + position-wise AdaLN)
+│   └── latent_fm.py             # Latent FM encoder + SDE sampler
 ├── training/
-│   ├── train_decoder.py       # Decoder training loop (Accelerate)
-│   └── train_latent_fm.py     # Latent FM training loop (Accelerate)
+│   ├── train_decoder.py         # Decoder training loop (Accelerate)
+│   └── train_latent_fm.py       # Latent FM training loop (Accelerate)
 ├── inference/
-│   └── generate.py            # Three-mode generation + CLI
+│   └── generate.py              # Three-mode generation + CLI
 └── utils/
-    └── spherical.py           # Spherical exp/log maps, geodesic interpolation
+    └── spherical.py             # Spherical exp/log maps, geodesic interpolation
 
-esm/                           # Meta ESM2 (submodule)
-Protenix/                      # ByteDance Protenix / AF3 (submodule)
-LFM/                           # Latent Flow Matching reference (submodule)
+scripts/
+├── preprocess.sh                # SLURM: LMDB 전처리 (GPU 1개)
+├── train_decoder.sh             # SLURM: SFM decoder 학습 (GPU 2개)
+└── train_latent_fm.sh           # SLURM: Latent FM 학습 (GPU 2개)
+
+esm/                             # Meta ESM2 (submodule)
+Protenix/                        # ByteDance Protenix / AF3 (submodule)
+LFM/                             # Latent Flow Matching reference (submodule)
 ```
 
 ---
@@ -80,13 +86,15 @@ LFM/                           # Latent Flow Matching reference (submodule)
 ## Installation
 
 ```bash
-git clone https://github.com/kimsukimsu/MSA_GENERATION.git
-cd MSA_GENERATION
+git clone https://github.com/DeepFoldProtein/MSA_FLOW.git
+cd MSA_FLOW
 
-# Core dependencies
-pip install torch torchvision torchaudio
-pip install accelerate omegaconf lmdb tqdm
-pip install fair-esm                     # ESM2
+# uv로 가상환경 생성 및 의존성 설치
+uv venv
+uv sync
+
+# pre-commit 훅 설정
+pre-commit install
 
 # Protenix (AF3 MSAModule)
 cd Protenix && pip install -e . && cd ..
@@ -94,17 +102,87 @@ cd Protenix && pip install -e . && cd ..
 
 ---
 
-## Quick Start
+## Training Pipeline
+
+전처리부터 학습까지 3단계로 구성됩니다.
+
+```
+A3M 파일 (uniclust30)
+    ↓  Step 1. preprocess.sh
+msaflow.lmdb
+    ↓  Step 2. train_decoder.sh
+decoder_ema_final.pt
+    ↓  Step 3. train_latent_fm.sh
+latent_fm_ema_final.pt
+```
+
+### Step 1. 전처리 — LMDB 빌드
+
+OpenFold A3M 파일을 읽어 Protenix MSA embedding (L×128)과 ESM2 query embedding (L×1280)을 LMDB로 저장합니다.
+
+```bash
+# 경로를 환경변수로 지정
+A3M_DIR=/store/database/openfold/uniclust30 \
+OUTPUT_LMDB=/store/msaflow.lmdb \
+PROTENIX_CKPT=/path/to/protenix.ckpt \
+sbatch scripts/preprocess.sh
+```
+
+> `PROTENIX_CKPT` 생략 시 ESM2 embedding만 저장됩니다 (decoder 학습에는 Protenix embedding이 필요합니다).
+
+### Step 2. SFM Decoder 학습
+
+```bash
+LMDB_PATH=/store/msaflow.lmdb \
+OUTPUT_DIR=/store/runs/decoder \
+sbatch scripts/train_decoder.sh
+```
+
+| 설정 | 값 |
+|------|-----|
+| epochs | 7 |
+| LR | 1e-5 |
+| warmup steps | 5000 |
+| weight decay | 0.1 |
+| precision | BF16 |
+| EMA decay | 0.9999 |
+
+### Step 3. Latent FM 학습
+
+```bash
+LMDB_PATH=/store/msaflow.lmdb \
+OUTPUT_DIR=/store/runs/latent_fm \
+sbatch scripts/train_latent_fm.sh
+```
+
+| 설정 | 값 |
+|------|-----|
+| epochs | 15 |
+| LR | 2.6e-4 |
+| warmup steps | 3000 |
+| weight decay | 0.1 |
+| precision | BF16 |
+| EMA decay | 0.9999 |
+
+### SLURM 의존성 체인 (자동 순서 실행)
+
+```bash
+JID1=$(sbatch --parsable scripts/preprocess.sh)
+JID2=$(sbatch --parsable --dependency=afterok:$JID1 scripts/train_decoder.sh)
+sbatch --dependency=afterok:$JID2 scripts/train_latent_fm.sh
+```
+
+---
+
+## Quick Start (SLURM 없이 직접 실행)
 
 ### 1. Build the LMDB dataset
 
-Preprocesses OpenFold A3M files: extracts Protenix MSA embeddings (L×128) and ESM2 query embeddings (L×1280).
-
 ```bash
-python msaflow/data/preprocessing.py \
-  --a3m_dir      /data/openfold_a3m \
-  --output       /data/msaflow.lmdb \
-  --protenix_checkpoint /models/protenix.pt \
+python -m msaflow.data.preprocessing \
+  --a3m_dir      /store/database/openfold/uniclust30 \
+  --output       /store/msaflow.lmdb \
+  --protenix_checkpoint /models/protenix.ckpt \
   --max_msa_seqs 512 \
   --max_seq_len  1024 \
   --device       cuda
@@ -114,30 +192,23 @@ python msaflow/data/preprocessing.py \
 
 ```bash
 accelerate launch \
-  --config_file msaflow/configs/accelerate_4gpu.yaml \
+  --config_file msaflow/configs/accelerate_2gpu.yaml \
   msaflow/training/train_decoder.py \
   --config      msaflow/configs/decoder.yaml \
-  --lmdb_path   /data/msaflow.lmdb \
+  --lmdb_path   /store/msaflow.lmdb \
   --output_dir  /runs/decoder
 ```
-
-Training settings (paper Section 6.8.2):
-- 7 epochs · LR 1e-5 · warmup 5000 steps · weight decay 0.1
-- BF16 mixed precision · EMA decay 0.9999
 
 ### 3. Train the latent FM encoder
 
 ```bash
 accelerate launch \
-  --config_file msaflow/configs/accelerate_4gpu.yaml \
+  --config_file msaflow/configs/accelerate_2gpu.yaml \
   msaflow/training/train_latent_fm.py \
   --config      msaflow/configs/latent_fm.yaml \
-  --lmdb_path   /data/msaflow.lmdb \
+  --lmdb_path   /store/msaflow.lmdb \
   --output_dir  /runs/latent_fm
 ```
-
-Training settings:
-- 15 epochs · LR 2.6e-4 · warmup 3000 steps · weight decay 0.1
 
 ### 4. Inference
 
