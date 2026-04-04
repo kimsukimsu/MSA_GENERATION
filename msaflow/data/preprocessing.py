@@ -175,6 +175,7 @@ def extract_msa_embedding_protenix(
         m_seq: (L, 128) compressed MSA embedding.
     """
     L = len(seqs[0])
+    logger.info("Extracting MSA embedding  ----- %d seqs, L=%d", len(seqs), L)
 
     # Build dummy pair embedding z and single embedding s_inputs
     # (MSAModule updates z; we start from zeros for embedding extraction)
@@ -223,6 +224,7 @@ def extract_esm_embedding(
     Returns:
         emb: (L, 1280) ESM2 representation (BOS/EOS tokens removed).
     """
+    logger.info("Extracting ESM2 embedding  ----- query length=%d", len(query_seq))
     converter = alphabet.get_batch_converter()
     _, _, tokens = converter([("query", query_seq)])
     tokens = tokens.to(device)
@@ -259,6 +261,8 @@ def build_lmdb(
         device:               Compute device string.
         map_size_gb:          LMDB map size in GB.
     """
+    logger.info("build_lmdb started  ----- a3m_dir=%s  max_msa_seqs=%d  max_seq_len=%d",
+                a3m_dir, max_msa_seqs, max_seq_len)
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
 
     # Load Protenix if checkpoint provided
@@ -292,7 +296,9 @@ def build_lmdb(
     )
 
     n_written = 0
-    for a3m_path in tqdm(a3m_files, desc="Building LMDB"):
+    n_total = len(a3m_files)
+    milestone_interval = max(1, n_total // 10)  # log every ~10%
+    for file_idx, a3m_path in enumerate(tqdm(a3m_files, desc="Building LMDB")):
         key = a3m_path.stem
         try:
             names, seqs = parse_a3m(str(a3m_path))
@@ -332,11 +338,16 @@ def build_lmdb(
                 txn.put(key.encode(), pickle.dumps(entry))
             n_written += 1
 
+            if n_written % milestone_interval == 0 or n_written % 100 == 0:
+                logger.info("Progress  ----- %d / %d files processed (%d written)",
+                            file_idx + 1, n_total, n_written)
+
         except Exception as exc:
             logger.warning("Skipped %s: %s", a3m_path.name, exc)
 
     env.close()
-    logger.info("Wrote %d entries to %s", n_written, output_path)
+    logger.info("build_lmdb complete  ----- %d / %d entries written to %s",
+                n_written, n_total, output_path)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -346,7 +357,11 @@ def build_lmdb(
 if __name__ == "__main__":
     import argparse
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  [ %(name)s ]  %(message)s",
+        datefmt="%Y-%m-%d %H:%M",
+    )
     parser = argparse.ArgumentParser(description="Build MSAFlow LMDB dataset")
     parser.add_argument("--a3m_dir",              required=True)
     parser.add_argument("--output",               required=True)

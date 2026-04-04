@@ -128,6 +128,7 @@ def decode_from_embedding(
         device = next(decoder.parameters()).device
 
     L, msa_dim = m_seq.shape
+    logger.info("decode_from_embedding  ----- n_seqs=%d  n_steps=%d  L=%d", n_seqs, n_steps, L)
     m_seq_batch = m_seq.unsqueeze(0).expand(n_seqs, -1, -1).to(device)  # (n, L, msa_dim)
 
     # Start from noise on the sphere
@@ -149,6 +150,7 @@ def decode_from_embedding(
     for row in token_ids:
         seq = "".join(AA_LIST[i] for i in row.tolist())
         seqs.append(seq)
+    logger.info("decode_from_embedding complete  ----- generated %d sequences", len(seqs))
     return seqs
 
 
@@ -183,6 +185,7 @@ def reconstruct(
     if device is None:
         device = next(decoder.parameters()).device
 
+    logger.info("Reconstruction mode  ----- MSA depth=%d  L=%d", len(msa_seqs), len(msa_seqs[0]))
     m_seq = extract_msa_embedding_protenix(msa_seqs, protenix_model, device)  # (L, 128)
     return decode_from_embedding(decoder, m_seq, n_seqs=n_seqs, n_steps=n_steps, device=device)
 
@@ -237,6 +240,7 @@ def augment_shallow(
     if device is None:
         device = next(decoder.parameters()).device
 
+    logger.info("augment_shallow  ----- shallow MSA depth=%d  L=%d", len(shallow_seqs), len(shallow_seqs[0]))
     query_seq = shallow_seqs[0].replace("-", "")
     L_aligned = len(shallow_seqs[0])
 
@@ -252,6 +256,7 @@ def augment_shallow(
     generated_seqs = []
 
     # ── Synthetic track (Syn): latent FM seeds ────────────────────────────────
+    logger.info("Syn track  ----- %d seeds x %d seqs/seed", n_syn_seeds, n_seqs_per_seed)
     for _ in range(n_syn_seeds):
         z_syn = sample_msa_embeddings(
             latent_fm, esm_emb, n_steps=n_steps, temperature=temperature
@@ -262,6 +267,7 @@ def augment_shallow(
         generated_seqs.extend(syn_seqs)
 
     # ── Reconstruction track (Rec): from shallow MSA embedding ───────────────
+    logger.info("Rec track  ----- %d seqs from shallow MSA embedding", n_rec_seqs)
     m_seq = extract_msa_embedding_protenix(shallow_seqs, protenix_model, device)   # (L, 128)
     rec_seqs = decode_from_embedding(
         decoder, m_seq, n_seqs=n_rec_seqs, n_steps=n_steps, device=device
@@ -269,6 +275,7 @@ def augment_shallow(
     generated_seqs.extend(rec_seqs)
 
     # ── Select n_diverse most diverse sequences ───────────────────────────────
+    logger.info("Diversity selection  ----- picking %d from %d candidates", n_diverse, len(generated_seqs))
     diverse = _select_diverse(generated_seqs, n_diverse)
 
     return list(shallow_seqs) + diverse
@@ -316,12 +323,15 @@ def generate_zeroshot(
     if device is None:
         device = next(decoder.parameters()).device
 
+    logger.info("generate_zeroshot  ----- query L=%d  n_seeds=%d  n_seqs/seed=%d",
+                len(query_seq), n_seeds, n_seqs_per_seed)
     esm_emb = extract_esm_embedding(query_seq, esm_model, alphabet, device)   # (L, 1280)
     esm_emb_batch = esm_emb.unsqueeze(0).to(device)                           # (1, L, 1280)
 
     best_seqs, best_diversity = None, -1.0
 
     for seed in range(n_seeds):
+        logger.info("Seed %d / %d  -----", seed + 1, n_seeds)
         torch.manual_seed(seed)
         z_syn = sample_msa_embeddings(
             latent_fm, esm_emb_batch, n_steps=n_steps, temperature=temperature
@@ -331,10 +341,13 @@ def generate_zeroshot(
             decoder, z_syn[0].cpu(), n_seqs=n_seqs_per_seed, n_steps=n_steps, device=device
         )
         div = _mean_pairwise_diversity(seqs)
+        logger.info("Seed %d diversity=%.4f  %s", seed + 1, div,
+                     "(new best)" if div > best_diversity else "")
         if div > best_diversity:
             best_diversity = div
             best_seqs = seqs
 
+    logger.info("generate_zeroshot complete  ----- best diversity=%.4f", best_diversity)
     return best_seqs
 
 
@@ -405,7 +418,11 @@ def write_a3m(query_seq: str, seqs: list[str], path: str, prefix: str = "gen"):
 def main():
     import argparse
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  [ %(name)s ]  %(message)s",
+        datefmt="%Y-%m-%d %H:%M",
+    )
     parser = argparse.ArgumentParser(description="MSAFlow generation")
     parser.add_argument("--mode",           required=True, choices=["reconstruct", "augment", "zeroshot"])
     parser.add_argument("--query_seq",      default=None,  help="Single query sequence (for zeroshot/augment)")
