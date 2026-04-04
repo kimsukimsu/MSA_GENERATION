@@ -22,7 +22,8 @@ env/
 *.pt
 *.pth
 *.ckpt
-/data/
+/data/*
+!/data/.gitkeep
 /runs/
 /outputs/
 
