@@ -10,8 +10,14 @@
 #SBATCH --output=logs/preprocess_%j.out
 #SBATCH --error=logs/preprocess_%j.err
 
+# ── Python 모듈 로드 ───────────────────────────────────────────────────────────
+module load python/3.11.14
+
+# ── uv PATH 설정 ──────────────────────────────────────────────────────────────
+export PATH="$HOME/.local/bin:$PATH"
+
 # ── 경로 설정 (환경에 맞게 수정) ──────────────────────────────────────────────
-REPO_DIR=${REPO_DIR:-$HOME/MSA_Generation}
+REPO_DIR=${REPO_DIR:-$HOME/projects/MSA_FLOW}
 A3M_DIR=${A3M_DIR:-/store/database/openfold/uniclust30}
 OUTPUT_LMDB=${OUTPUT_LMDB:-/store/msaflow.lmdb}
 PROTENIX_CKPT=${PROTENIX_CKPT:-""}   # 없으면 ESM2만 추출
@@ -20,10 +26,11 @@ PROTENIX_CKPT=${PROTENIX_CKPT:-""}   # 없으면 ESM2만 추출
 source $REPO_DIR/.venv/bin/activate
 
 # ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────
-mkdir -p logs
+mkdir -p $REPO_DIR/logs
 
 echo "Job ID     : $SLURM_JOB_ID"
 echo "Node       : $SLURMD_NODENAME"
+echo "Python     : $(python --version)"
 echo "A3M dir    : $A3M_DIR"
 echo "Output     : $OUTPUT_LMDB"
 echo "Protenix   : ${PROTENIX_CKPT:-'(skipped)'}"
