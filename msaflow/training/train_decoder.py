@@ -71,6 +71,7 @@ class EMA:
     @torch.no_grad()
     def update(self, model: nn.Module):
         for name, param in model.named_parameters():
+            self.shadow[name] = self.shadow[name].to(param.device)
             self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
     def copy_to(self, model: nn.Module):
