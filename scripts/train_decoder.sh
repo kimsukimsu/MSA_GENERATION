@@ -29,8 +29,9 @@ source $REPO_DIR/.venv/bin/activate
 
 # ── NCCL 튜닝 ─────────────────────────────────────────────────────────────────
 export NCCL_DEBUG=WARN
-export NCCL_IB_DISABLE=0
-export NCCL_P2P_DISABLE=0
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1   # GPU 1,2가 다른 PCIe root — P2P 비활성화
+export NCCL_SHM_DISABLE=0   # shared memory 통신 사용
 export OMP_NUM_THREADS=8
 
 # ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────

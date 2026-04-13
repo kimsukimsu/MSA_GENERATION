@@ -28,8 +28,9 @@ source $REPO_DIR/.venv/bin/activate
 
 # ── NCCL 튜닝 ─────────────────────────────────────────────────────────────────
 export NCCL_DEBUG=WARN
-export NCCL_IB_DISABLE=0
-export NCCL_P2P_DISABLE=0
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
+export NCCL_SHM_DISABLE=0
 export OMP_NUM_THREADS=8
 
 # ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────
