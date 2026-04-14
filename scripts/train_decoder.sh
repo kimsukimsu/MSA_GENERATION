@@ -19,7 +19,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 # ── 경로 설정 (환경에 맞게 수정) ──────────────────────────────────────────────
 REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
-LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow.lmdb}
+LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/decoder}
 CONFIG=$REPO_DIR/msaflow/configs/decoder.yaml
 ACCEL_CONFIG=$REPO_DIR/msaflow/configs/accelerate_2gpu.yaml

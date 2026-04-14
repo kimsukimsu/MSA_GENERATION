@@ -32,10 +32,97 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
+import numpy as np
+
 from msaflow.models.sfm_decoder import SFMDecoder, sfm_loss
 from msaflow.data.dataset import MSADecoderDataset, decoder_collate_fn
+from msaflow.utils.spherical import sample_sphere_noise, euler_step_sphere, decode_sequences
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation: generation quality metrics beyond loss
+# ──────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def validate_generation(
+    model: SFMDecoder,
+    val_batch: dict,
+    vocab_size: int,
+    n_steps: int = 50,
+    gap_token: int = 20,
+) -> dict:
+    """
+    Generate sequences via Euler integration and compute quality metrics.
+
+    Metrics logged:
+      val/seq_recovery   — fraction of tokens matching reference (accuracy)
+      val/gap_frac       — fraction of gap tokens in generated sequences
+      val/neff_generated — Neff of generated MSA (diversity indicator)
+      val/aa_kl_div      — mean per-position KL(generated ∥ reference AA dist)
+
+    Args:
+        model:      unwrapped SFMDecoder in eval mode.
+        val_batch:  dict with keys msa_emb (B,L,128), tokens (B,L).
+        vocab_size: V = 22.
+        n_steps:    Euler integration steps (50 is sufficient).
+        gap_token:  index of the gap '-' token.
+
+    Returns:
+        dict of scalar metrics.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    msa_emb = val_batch["msa_emb"].to(device)   # (B, L, 128)
+    ref_tokens = val_batch["tokens"].to(device)  # (B, L)
+    B, L = ref_tokens.shape
+
+    # ── ODE integration: x0 (noise) → x1 (generated) ─────────────────────────
+    x_t = sample_sphere_noise((B, L, vocab_size), device=device, dtype=msa_emb.dtype)
+    dt = 1.0 / n_steps
+    for i in range(n_steps):
+        t = torch.full((B,), i * dt, device=device, dtype=msa_emb.dtype)
+        v = model(x_t, msa_emb, t)
+        x_t = euler_step_sphere(x_t, v, dt)
+
+    # ── Decode to tokens ─────────────────────────────────────────────────────
+    gen_tokens = decode_sequences(x_t, temperature=0.0)  # (B, L) — argmax
+
+    # ── Sequence recovery (token accuracy) ────────────────────────────────────
+    seq_recovery = (gen_tokens == ref_tokens).float().mean().item()
+
+    # ── Gap fraction ──────────────────────────────────────────────────────────
+    gap_frac = (gen_tokens == gap_token).float().mean().item()
+
+    # ── Neff of generated MSA ─────────────────────────────────────────────────
+    gen_np = gen_tokens.cpu().numpy()   # (B, L)
+    diff = (gen_np[:, None, :] != gen_np[None, :, :]).mean(axis=-1)   # (B, B)
+    counts = (diff < 0.2).sum(axis=1).astype(np.float32)
+    neff_generated = float((1.0 / counts.clip(min=1.0)).sum())
+
+    # ── AA distribution KL divergence ─────────────────────────────────────────
+    # Per-position distribution comparison (non-gap positions only)
+    gen_oh = torch.zeros(B, L, vocab_size, device=device)
+    gen_oh.scatter_(2, gen_tokens.unsqueeze(-1), 1.0)
+    ref_oh = torch.zeros(B, L, vocab_size, device=device)
+    ref_oh.scatter_(2, ref_tokens.unsqueeze(-1), 1.0)
+
+    gen_dist = gen_oh.mean(dim=0).clamp(min=1e-8)   # (L, V) empirical freq
+    ref_dist = ref_oh.mean(dim=0).clamp(min=1e-8)   # (L, V)
+    gen_dist = gen_dist / gen_dist.sum(dim=-1, keepdim=True)
+    ref_dist = ref_dist / ref_dist.sum(dim=-1, keepdim=True)
+
+    kl = (ref_dist * (ref_dist.log() - gen_dist.log())).sum(dim=-1)  # (L,)
+    aa_kl_div = kl.mean().item()
+
+    return {
+        "val/seq_recovery":   seq_recovery,
+        "val/gap_frac":       gap_frac,
+        "val/neff_generated": neff_generated,
+        "val/aa_kl_div":      aa_kl_div,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -144,7 +231,9 @@ def train(cfg):
         weight_decay=cfg.training.weight_decay,
         betas=(0.9, 0.95),
     )
-    total_steps = len(loader) * cfg.training.epochs // cfg.training.grad_accumulation
+    # Divide by num_processes: accelerator.prepare() gives each GPU len(loader)/N batches.
+    # Computing before prepare() over-counts by num_processes, making LR decay 2× too fast.
+    total_steps = (len(loader) // accelerator.num_processes) * cfg.training.epochs // cfg.training.grad_accumulation
     scheduler = get_lr_schedule(
         optimizer,
         warmup_steps=cfg.training.warmup_steps,
@@ -161,13 +250,23 @@ def train(cfg):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        # Reset optimizer LR to cfg value — load_state_dict restores the old (near-zero) LR.
+        for pg in optimizer.param_groups:
+            pg["lr"] = cfg.training.lr
         scheduler.load_state_dict(ckpt["scheduler"])
+        # Reset scheduler: rebuild from scratch so warmup starts fresh.
+        scheduler = get_lr_schedule(
+            optimizer,
+            warmup_steps=cfg.training.warmup_steps,
+            total_steps=total_steps,
+        )
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
         if ema is not None and "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])
         if accelerator.is_main_process:
-            logger.info("Resumed from epoch %d, step %d", start_epoch, global_step)
+            logger.info("Resumed from epoch %d, step %d  (LR reset to %.2e)",
+                        start_epoch, global_step, cfg.training.lr)
 
     # ── Prepare with Accelerate ───────────────────────────────────────────────
     model, optimizer, loader, scheduler = accelerator.prepare(
@@ -188,6 +287,14 @@ def train(cfg):
             log="gradients",
             log_freq=cfg.training.log_every,
         )
+
+    # ── Validation batch (fixed single MSA for consistent comparison) ──────────
+    # We use a single MSA (not collated) so that Neff and KL are meaningful
+    # within a protein family, not across mixed families.
+    val_every = cfg.training.get("val_every", 0)   # 0 = no validation
+    val_item = None
+    if val_every > 0 and accelerator.is_main_process:
+        val_item = dataset[0]   # fixed entry: msa_emb (L,128), tokens (n_seqs,L)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     if accelerator.is_main_process:
@@ -242,6 +349,34 @@ def train(cfg):
                         "train/epoch": epoch,
                         "train/batch_idx": batch_idx,
                     }, step=global_step)
+
+        # ── Validation ───────────────────────────────────────────────────────
+        if val_every > 0 and (epoch + 1) % val_every == 0 and accelerator.is_main_process:
+            # val_item: single MSA — msa_emb (L,128), tokens (n_seqs,L)
+            # Expand msa_emb to match each sequence: (n_seqs, L, 128)
+            n_seqs_val = val_item["tokens"].shape[0]
+            val_batch = {
+                "msa_emb": val_item["msa_emb"].unsqueeze(0).expand(n_seqs_val, -1, -1),
+                "tokens":  val_item["tokens"],
+            }
+            val_metrics = validate_generation(
+                accelerator.unwrap_model(model),
+                val_batch,
+                vocab_size=cfg.model.vocab_size,
+                n_steps=cfg.training.get("val_ode_steps", 50),
+            )
+            logger.info(
+                "Epoch %d val | recovery=%.3f  gap=%.3f  neff=%.1f  kl=%.4f",
+                epoch,
+                val_metrics["val/seq_recovery"],
+                val_metrics["val/gap_frac"],
+                val_metrics["val/neff_generated"],
+                val_metrics["val/aa_kl_div"],
+            )
+            if use_wandb:
+                import wandb
+                wandb.log(val_metrics, step=global_step)
+            model.train()
 
         # ── Checkpoint ───────────────────────────────────────────────────────
         if accelerator.is_main_process:
