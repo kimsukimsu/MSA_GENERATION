@@ -304,6 +304,7 @@ def train(cfg):
         model.train()
         epoch_loss = 0.0
 
+        grad_norm = 0.0   # initialised before first sync_gradients assignment
         for batch_idx, batch in enumerate(loader):
             with accelerator.accumulate(model):
                 msa_emb = batch["msa_emb"]      # (B_flat, L, 128)
