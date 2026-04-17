@@ -440,6 +440,8 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     decoder = load_sfm_decoder(args.decoder_ckpt, device)
 
+    generated = []
+
     if args.mode == "reconstruct":
         assert args.input_a3m and args.protenix_ckpt, "--input_a3m and --protenix_ckpt required"
         protenix = load_protenix(args.protenix_ckpt, device)
@@ -455,8 +457,8 @@ def main():
         esm_model, alphabet = load_esm2(device)
         _, seqs = parse_a3m(args.input_a3m)
         seqs = filter_msa(seqs)
-        combined = augment_shallow(seqs, decoder, latent_fm, protenix, esm_model, alphabet, device=device)
-        write_a3m(seqs[0].replace("-", ""), combined, args.output)
+        generated = augment_shallow(seqs, decoder, latent_fm, protenix, esm_model, alphabet, device=device)
+        write_a3m(seqs[0].replace("-", ""), generated, args.output)
 
     elif args.mode == "zeroshot":
         assert args.query_seq and args.latent_fm_ckpt
@@ -467,7 +469,8 @@ def main():
             n_seqs_per_seed=args.n_seqs, n_steps=args.n_steps,
             temperature=args.temperature, device=device,
         )
-        write_fasta(generated, args.output)
+        # Write as A3M (query header + generated seqs) so Protenix can use it
+        write_a3m(args.query_seq, generated, args.output)
 
     logger.info("Wrote %d sequences to %s", len(generated), args.output)
 
