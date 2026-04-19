@@ -131,8 +131,9 @@ def decode_from_embedding(
     logger.info("decode_from_embedding  ----- n_seqs=%d  n_steps=%d  L=%d", n_seqs, n_steps, L)
     m_seq_batch = m_seq.unsqueeze(0).expand(n_seqs, -1, -1).to(device)  # (n, L, msa_dim)
 
-    # Start from noise on the sphere
-    x_t = sample_sphere_noise((n_seqs, L, decoder.vocab_size), device=device, dtype=m_seq.dtype)
+    # Start from noise on the sphere — float32 for numerical stability in sphere ops.
+    # Using m_seq.dtype (bf16 when latent FM output) would degrade ODE integration precision.
+    x_t = sample_sphere_noise((n_seqs, L, decoder.vocab_size), device=device, dtype=torch.float32)
 
     dt = 1.0 / n_steps
 
@@ -262,7 +263,8 @@ def augment_shallow(
             latent_fm, esm_emb, n_steps=n_steps, temperature=temperature
         )  # (1, L, 128)
         syn_seqs = decode_from_embedding(
-            decoder, z_syn[0].cpu(), n_seqs=n_seqs_per_seed, n_steps=n_steps, device=device
+            decoder, z_syn[0].cpu(), n_seqs=n_seqs_per_seed, n_steps=n_steps,
+            temperature=temperature, device=device
         )
         generated_seqs.extend(syn_seqs)
 
@@ -270,7 +272,8 @@ def augment_shallow(
     logger.info("Rec track  ----- %d seqs from shallow MSA embedding", n_rec_seqs)
     m_seq = extract_msa_embedding_protenix(shallow_seqs, protenix_model, device)   # (L, 128)
     rec_seqs = decode_from_embedding(
-        decoder, m_seq, n_seqs=n_rec_seqs, n_steps=n_steps, device=device
+        decoder, m_seq, n_seqs=n_rec_seqs, n_steps=n_steps,
+        temperature=temperature, device=device
     )
     generated_seqs.extend(rec_seqs)
 
@@ -338,7 +341,8 @@ def generate_zeroshot(
         )  # (1, L, 128)
 
         seqs = decode_from_embedding(
-            decoder, z_syn[0].cpu(), n_seqs=n_seqs_per_seed, n_steps=n_steps, device=device
+            decoder, z_syn[0].cpu(), n_seqs=n_seqs_per_seed, n_steps=n_steps,
+            temperature=temperature, device=device
         )
         div = _mean_pairwise_diversity(seqs)
         logger.info("Seed %d diversity=%.4f  %s", seed + 1, div,

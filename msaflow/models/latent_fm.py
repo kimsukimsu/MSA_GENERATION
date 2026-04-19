@@ -243,8 +243,10 @@ def sample_msa_embeddings(
     z_t = torch.randn(B, L, model.msa_dim, device=device, dtype=esm_emb.dtype)
 
     dt = 1.0 / n_steps
-    # Integrate from t=1 (noise) down to t=0 (data)
-    t_vals = torch.linspace(1.0, dt, n_steps, device=device)
+    # Integrate from t=1-dt (noise) down to t=dt (data).
+    # Starts at 1.0-dt instead of 1.0: at t=1, g_t = sqrt(2/(1-t)) → sqrt(2/eps) = 1414
+    # which causes the SDE noise term to explode on the very first step when temperature > 0.
+    t_vals = torch.linspace(1.0 - dt, dt, n_steps, device=device)
 
     for t_val in t_vals:
         t = t_val.expand(B)                              # (B,)

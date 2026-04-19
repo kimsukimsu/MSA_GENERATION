@@ -281,6 +281,7 @@ def run_quality_eval(args):
             decoder, m_seq,
             n_seqs=args.n_seqs,
             n_steps=args.n_steps,
+            temperature=args.temperature,
             device=device,
         )
         gen_tokens = seqs_to_tokens(gen_seqs)   # (n_seqs, L)

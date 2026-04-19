@@ -277,19 +277,43 @@ def sfm_loss(
     tokens: torch.Tensor,
     m_seq: torch.Tensor,
     weights: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
+    t_max_eps: float = 0.01,
 ) -> torch.Tensor:
     """
     Compute SFM training loss for one batch.
 
-    L_SFM(θ) = E_{t, s_i, µ_0}[‖v_θ(x_t|m,t) − u_t(x_t|x_0,x_1)‖²]
+    L_SFM(θ) = E_{t, s_i, µ_0}[w(t) · ‖v_θ(x_t|m,t) − u_t(x_t|x_0,x_1)‖²]
+
+    Gradient explosion fix (grad_norm was 1305 with uniform t ∈ [0,1]):
+      u_t = log_{x_t}(x1) / (1-t) is theoretically O(1), but near t=1 the
+      log_map numerator involves `y - dot*x` between nearly-identical bfloat16
+      vectors (SNR≈1 at t=0.99), then division by (1-t)=0.01 amplifies noise
+      100×.  Three fixes inspired by LFM's (1e-5 + (1-1e-5)·t) endpoint trick:
+
+      Fix 1 — time truncation: t ∈ [0, 1-t_max_eps] (default [0, 0.99]).
+        At t_max=0.99 the denominator floor is 0.01; the (1-t)² weight at that
+        point is 0.0001 so its gradient contribution is negligible.
+        Matches inference Euler max t = (n_steps-1)/n_steps = 0.99.
+      Fix 2 — (1-t)² loss weight: E[(1-t)²‖v-u_t‖²] = E[‖(1-t)v-log‖²].
+        The rewritten loss is bounded O(‖log‖²) with no 1/(1-t) divergence.
+        The theoretical minimiser is unchanged since u_t is constant along
+        geodesics — only the per-t gradient variance is reduced.
+      Fix 3 — float32 loss: cast v_pred to float32 before MSE to avoid
+        bfloat16 accumulation errors in the final subtraction.
 
     Args:
-        model:   SFMDecoder.
-        tokens:  (B, L) integer token ids in [0, vocab_size).
-        m_seq:   (B, L, msa_dim) compressed MSA embedding.
-        weights: (B,) optional per-sample loss weights (Neff reweighting).
-        eps:     numerical stability constant.
+        model:      SFMDecoder.
+        tokens:     (B, L) integer token ids in [0, vocab_size).
+        m_seq:      (B, L, msa_dim) compressed MSA embedding.
+        weights:    (B,) optional per-sample loss weights (Neff reweighting).
+        padding_mask: (B, L) bool tensor — True at real positions, False at padding.
+                      Excludes padded positions from the loss (relevant when batch_size>1
+                      and MSAs of different lengths are packed into the same batch).
+        eps:        numerical stability constant for sphere ops.
+        t_max_eps:  upper time truncation margin (default 0.01 → t ∈ [0, 0.99]),
+                    matching inference Euler max t = (n_steps-1)/n_steps = 0.99.
 
     Returns:
         loss: scalar.
@@ -304,30 +328,46 @@ def sfm_loss(
     B, L = tokens.shape
     device = tokens.device
 
-    # x1: data on sphere  (B, L, V)
-    x1 = onehot_to_sphere(tokens, model.vocab_size, eps=eps)
+    # x1: data on sphere — float32 for geometric ops (independent of autocast)
+    x1 = onehot_to_sphere(tokens, model.vocab_size, eps=eps)   # (B, L, V) float32
 
-    # x0: noise on sphere (B, L, V)
-    x0 = sample_sphere_noise((B, L, model.vocab_size), device=device, dtype=x1.dtype)
+    # x0: noise on sphere (B, L, V) float32
+    x0 = sample_sphere_noise((B, L, model.vocab_size), device=device, dtype=torch.float32)
 
-    # Sample time uniformly
-    t = torch.rand(B, device=device)                           # (B,)
-    t_bcast = t.view(B, 1, 1)                                  # for broadcasting over (L, V)
+    # Fix 1: sample t with upper truncation, analogous to LFM's (1e-5+(1-1e-5)·t)
+    # that prevents the interpolation endpoint from being reached exactly.
+    t = torch.rand(B, device=device) * (1.0 - t_max_eps)      # (B,)  ∈ [0, 1-t_max_eps]
+    t_bcast = t.view(B, 1, 1)                                  # (B, 1, 1)
 
-    # Geodesic interpolation
-    x_t = geodesic_interpolate(x0, x1, t_bcast, eps=eps)      # (B, L, V)
+    # Geodesic interpolation and target velocity — both in float32
+    x_t = geodesic_interpolate(x0, x1, t_bcast, eps=eps)      # (B, L, V) float32
+    u_t = target_velocity(x_t, x1, t_bcast, eps=eps)          # (B, L, V) float32
 
-    # Target velocity in tangent space at x_t
-    u_t = target_velocity(x_t, x1, t_bcast, eps=eps)          # (B, L, V)
-
-    # Predicted velocity
+    # Predicted velocity (may be bfloat16 under Accelerate autocast)
     v_pred = model(x_t, m_seq, t)                              # (B, L, V)
 
-    # MSE loss in tangent space
-    loss = ((v_pred - u_t) ** 2).sum(dim=-1)                   # (B, L)
+    # Fix 3: upcast to float32 before MSE to avoid bf16 subtraction noise
+    loss = ((v_pred.float() - u_t) ** 2).sum(dim=-1)           # (B, L)
+
+    # Fix 2: (1-t)² weighting — down-weights high-t samples where u_t is noisier
+    wt = (1.0 - t) ** 2                                        # (B,)  ∈ [t_max_eps², 1]
+    loss = loss * wt.unsqueeze(1)                               # (B, L)
+
+    if padding_mask is not None:
+        # padding_mask: (B, L) bool — zero out padded positions so they don't
+        # contribute to the gradient (avoids training the model to predict
+        # token 0 / Alanine at padding positions).
+        loss = loss * padding_mask.float()                     # (B, L)
 
     if weights is not None:
-        # weights: (B,) — down-weight redundant sequences
+        # weights: (B,) — down-weight redundant sequences via Neff reweighting
         loss = loss * weights.unsqueeze(1)                     # (B, L)
 
-    return loss.mean()
+    # Normalise by the number of real (non-padded) positions so the loss scale
+    # stays invariant to sequence length and batch composition.
+    # When padding_mask is None every position is real, so this equals loss.mean().
+    if padding_mask is not None:
+        n_real = padding_mask.float().sum().clamp(min=1.0)
+    else:
+        n_real = loss.numel()
+    return loss.sum() / n_real

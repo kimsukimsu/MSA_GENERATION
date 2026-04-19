@@ -307,15 +307,25 @@ def train(cfg):
         grad_norm = 0.0   # initialised before first sync_gradients assignment
         for batch_idx, batch in enumerate(loader):
             with accelerator.accumulate(model):
-                msa_emb = batch["msa_emb"]      # (B_flat, L, 128)
-                tokens  = batch["tokens"]       # (B_flat, L)
-                weights = batch["weights"]      # (B_flat,)
+                msa_emb     = batch["msa_emb"]      # (B_flat, L, 128)
+                tokens      = batch["tokens"]       # (B_flat, L)
+                weights     = batch["weights"]      # (B_flat,)
+                seq_lengths = batch["seq_lengths"]  # (B_flat,)
+
+                # Build position mask: True at real residues, False at padding.
+                # With batch_size=1 all sequences have the same L so this is all-True.
+                # Matters when batch_size>1 and MSAs of different lengths are mixed.
+                L_max = tokens.shape[1]
+                pos = torch.arange(L_max, device=tokens.device).unsqueeze(0)  # (1, L)
+                padding_mask = pos < seq_lengths.unsqueeze(1)                 # (B_flat, L)
 
                 loss = sfm_loss(
                     accelerator.unwrap_model(model),
                     tokens,
                     msa_emb,
                     weights=weights,
+                    padding_mask=padding_mask,
+                    t_max_eps=cfg.training.get("t_max_eps", 0.01),
                 )
 
                 accelerator.backward(loss)

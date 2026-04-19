@@ -189,13 +189,17 @@ def decoder_collate_fn(batch: list[dict]) -> dict:
     Pads all sequences in the batch to the same length.
     The SFM decoder processes each sequence independently, so we flatten the
     (n_seqs, L) token arrays into the batch dimension:
-        tokens: (B * n_seqs, L_max)
-        msa_emb: (B * n_seqs, L_max, 128)   — repeated for each seq in the MSA
-        weights: (B * n_seqs,)
+        tokens:      (B * n_seqs, L_max)
+        msa_emb:     (B * n_seqs, L_max, 128)   — repeated for each seq in the MSA
+        weights:     (B * n_seqs,)
+        seq_lengths: (B * n_seqs,) — actual (unpadded) length of each sequence,
+                     used to mask padded positions out of the training loss.
+                     With batch_size=1 all sequences share the same L so the mask
+                     is all-True; with batch_size>1 (different MSAs) it matters.
     """
     L_max = max(item["msa_emb"].shape[0] for item in batch)
 
-    msa_embs, tokens_list, weights_list = [], [], []
+    msa_embs, tokens_list, weights_list, lengths_list = [], [], [], []
     for item in batch:
         L = item["msa_emb"].shape[0]
         n_seqs = item["tokens"].shape[0]
@@ -209,11 +213,13 @@ def decoder_collate_fn(batch: list[dict]) -> dict:
         msa_embs.append(msa_emb_pad.unsqueeze(0).expand(n_seqs, -1, -1))
         tokens_list.append(tokens_pad)
         weights_list.append(item["weights"])
+        lengths_list.append(torch.full((n_seqs,), L, dtype=torch.long))
 
     return {
-        "msa_emb": torch.cat(msa_embs, dim=0),        # (B*n_seqs, L_max, 128)
-        "tokens":  torch.cat(tokens_list, dim=0),      # (B*n_seqs, L_max)
-        "weights": torch.cat(weights_list, dim=0),     # (B*n_seqs,)
+        "msa_emb":     torch.cat(msa_embs, dim=0),        # (B*n_seqs, L_max, 128)
+        "tokens":      torch.cat(tokens_list, dim=0),      # (B*n_seqs, L_max)
+        "weights":     torch.cat(weights_list, dim=0),     # (B*n_seqs,)
+        "seq_lengths": torch.cat(lengths_list, dim=0),     # (B*n_seqs,)
     }
 
 
