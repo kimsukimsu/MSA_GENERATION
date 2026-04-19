@@ -33,9 +33,8 @@ training:
   mixed_precision: "bf16"
   use_wandb: true
   wandb_project: msaflow
-  wandb_run_name: decoder_d12_h768_lr1e5_merged
+  wandb_run_name: decoder_d12_h768_lr1e5_fixloss_v3
   val_every: 1          # validate every N epochs (0 = disabled)
-  val_ode_steps: 50     # Euler steps for ODE integration during validation
+  val_ode_steps: 100    # Euler steps for ODE integration (paper: Δt=0.01 = 100 steps)
   t_max_eps: 0.01       # time truncation: t ∈ [0, 1-t_max_eps] to avoid log_map instability near t=1
                         # 0.01 → training covers [0, 0.99], matching inference Euler max t=(n_steps-1)/n_steps=0.99
-                        # (cf. LFM's (1e-5 + (1-1e-5)*t) endpoint trick for bfloat16 stability)

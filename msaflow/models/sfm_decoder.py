@@ -282,26 +282,27 @@ def sfm_loss(
     t_max_eps: float = 0.01,
 ) -> torch.Tensor:
     """
-    Compute SFM training loss for one batch.
+    Compute SFM training loss for one batch (Eq. 3 in the paper).
 
-    L_SFM(θ) = E_{t, s_i, µ_0}[w(t) · ‖v_θ(x_t|m,t) − u_t(x_t|x_0,x_1)‖²]
+    L_SFM(θ) = E_{t~U[0,1], s_i, µ_0}[‖v_θ(x_t|m,t) − u_t(x_t|x_0,x_1)‖²]
 
-    Gradient explosion fix (grad_norm was 1305 with uniform t ∈ [0,1]):
-      u_t = log_{x_t}(x1) / (1-t) is theoretically O(1), but near t=1 the
-      log_map numerator involves `y - dot*x` between nearly-identical bfloat16
-      vectors (SNR≈1 at t=0.99), then division by (1-t)=0.01 amplifies noise
-      100×.  Three fixes inspired by LFM's (1e-5 + (1-1e-5)·t) endpoint trick:
+    Numerical stability fixes (original code had grad_norm=1305 due to bf16 ops):
 
-      Fix 1 — time truncation: t ∈ [0, 1-t_max_eps] (default [0, 0.99]).
-        At t_max=0.99 the denominator floor is 0.01; the (1-t)² weight at that
-        point is 0.0001 so its gradient contribution is negligible.
-        Matches inference Euler max t = (n_steps-1)/n_steps = 0.99.
-      Fix 2 — (1-t)² loss weight: E[(1-t)²‖v-u_t‖²] = E[‖(1-t)v-log‖²].
-        The rewritten loss is bounded O(‖log‖²) with no 1/(1-t) divergence.
-        The theoretical minimiser is unchanged since u_t is constant along
-        geodesics — only the per-t gradient variance is reduced.
-      Fix 3 — float32 loss: cast v_pred to float32 before MSE to avoid
-        bfloat16 accumulation errors in the final subtraction.
+      Fix 1 — float32 geometry: x0, x1, x_t and u_t computed in float32
+        independent of model autocast dtype.  At t=0.99 in bfloat16, the
+        log_map direction (y − dot·x) has SNR≈0.02; in float32 SNR≈750.
+
+      Fix 2 — float32 MSE: v_pred upcast before the squared error.
+
+      Fix 3 — time truncation: t ∈ [0, 1-t_max_eps] avoids the t=1 endpoint
+        where log_map involves near-identical points.  With t_max_eps=0.01
+        the remaining angle is 1% of the geodesic, giving SNR>100 in float32.
+
+    NOTE: (1-t)² time-weighting was previously applied but has been removed.
+    The paper loss (Eq. 3) uses uniform weighting over t.  The (1-t)² variant
+    created a severe train–inference mismatch: gradient signal at t>0.7 was
+    <9% of the t=0 signal, so the model never learned the high-t regime.
+    Inference integrates t=0→1 uniformly, causing garbage output in that range.
 
     Args:
         model:      SFMDecoder.
@@ -312,8 +313,7 @@ def sfm_loss(
                       Excludes padded positions from the loss (relevant when batch_size>1
                       and MSAs of different lengths are packed into the same batch).
         eps:        numerical stability constant for sphere ops.
-        t_max_eps:  upper time truncation margin (default 0.01 → t ∈ [0, 0.99]),
-                    matching inference Euler max t = (n_steps-1)/n_steps = 0.99.
+        t_max_eps:  upper time truncation margin (default 0.01 → t ∈ [0, 0.99]).
 
     Returns:
         loss: scalar.
@@ -328,30 +328,22 @@ def sfm_loss(
     B, L = tokens.shape
     device = tokens.device
 
-    # x1: data on sphere — float32 for geometric ops (independent of autocast)
+    # Fix 1: x1, x0, x_t and u_t all in float32 for stable sphere geometry
     x1 = onehot_to_sphere(tokens, model.vocab_size, eps=eps)   # (B, L, V) float32
-
-    # x0: noise on sphere (B, L, V) float32
     x0 = sample_sphere_noise((B, L, model.vocab_size), device=device, dtype=torch.float32)
 
-    # Fix 1: sample t with upper truncation, analogous to LFM's (1e-5+(1-1e-5)·t)
-    # that prevents the interpolation endpoint from being reached exactly.
+    # Fix 3: truncate t away from the t=1 singularity
     t = torch.rand(B, device=device) * (1.0 - t_max_eps)      # (B,)  ∈ [0, 1-t_max_eps]
     t_bcast = t.view(B, 1, 1)                                  # (B, 1, 1)
 
-    # Geodesic interpolation and target velocity — both in float32
     x_t = geodesic_interpolate(x0, x1, t_bcast, eps=eps)      # (B, L, V) float32
     u_t = target_velocity(x_t, x1, t_bcast, eps=eps)          # (B, L, V) float32
 
     # Predicted velocity (may be bfloat16 under Accelerate autocast)
     v_pred = model(x_t, m_seq, t)                              # (B, L, V)
 
-    # Fix 3: upcast to float32 before MSE to avoid bf16 subtraction noise
+    # Fix 2: upcast to float32 before MSE
     loss = ((v_pred.float() - u_t) ** 2).sum(dim=-1)           # (B, L)
-
-    # Fix 2: (1-t)² weighting — down-weights high-t samples where u_t is noisier
-    wt = (1.0 - t) ** 2                                        # (B,)  ∈ [t_max_eps², 1]
-    loss = loss * wt.unsqueeze(1)                               # (B, L)
 
     if padding_mask is not None:
         # padding_mask: (B, L) bool — zero out padded positions so they don't
