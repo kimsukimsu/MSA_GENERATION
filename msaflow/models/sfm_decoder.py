@@ -198,6 +198,10 @@ class SFMDecoder(nn.Module):
         self.time_emb = SinusoidalTimeEmbedding(hidden_size)
 
         # ── Conditioning projection (per-residue MSA emb → hidden) ────────────
+        # LayerNorm normalises AF3 MSA embeddings (std >> 1) before projection.
+        # Without it ∂L/∂W_cond inherits m_seq scale → cond_proj dominates
+        # total grad_norm and forces an effectively near-zero LR after clipping.
+        self.msa_norm = nn.LayerNorm(msa_dim)
         self.cond_proj = nn.Linear(msa_dim, hidden_size)
 
         # ── Transformer blocks ────────────────────────────────────────────────
@@ -258,7 +262,7 @@ class SFMDecoder(nn.Module):
 
         # Build per-position conditioning: time emb (broadcast) + MSA cond
         t_emb = self.time_emb(t).unsqueeze(1).expand(B, L, -1)  # (B, L, H)
-        cond = t_emb + self.cond_proj(m_seq)                     # (B, L, H)
+        cond = t_emb + self.cond_proj(self.msa_norm(m_seq))      # (B, L, H)
 
         # Transformer blocks with position-wise AdaLN
         for block in self.blocks:

@@ -22,18 +22,18 @@ training:
   lr: 1.0e-5
   weight_decay: 0.1
   warmup_steps: 5000
-  max_grad_norm: 1.0
+  max_grad_norm: 10.0
   grad_accumulation: 4
   seed: 42
   output_dir: /runs/decoder
-  resume: false
+  resume: false           # architecture changed (msa_norm added) — must restart
   log_every: 100
   ema_decay: 0.9999
   use_ema: true
   mixed_precision: "bf16"
   use_wandb: true
   wandb_project: msaflow
-  wandb_run_name: decoder_d12_h768_lr1e5_fixloss_v3
+  wandb_run_name: decoder_d12_h768_lr1e5_msanorm_gradclip10_v4
   val_every: 1          # validate every N epochs (0 = disabled)
   val_ode_steps: 100    # Euler steps for ODE integration (paper: Δt=0.01 = 100 steps)
   t_max_eps: 0.01       # time truncation: t ∈ [0, 1-t_max_eps] to avoid log_map instability near t=1
