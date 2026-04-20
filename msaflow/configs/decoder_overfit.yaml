@@ -37,10 +37,11 @@ training:
   grad_accumulation: 1    # no accumulation — see every gradient
   seed: 42
   output_dir: /runs/decoder_overfit
-  resume: false
+  resume: true
   log_every: 10           # frequent logging to watch loss curve
   ema_decay: 0.9999
   use_ema: false          # skip EMA overhead during debug
+  save_checkpoint_every: 50  # epoch_NNN.pt는 50 epoch마다만 저장 (디스크 절약)
   mixed_precision: "bf16"
   use_wandb: true
   wandb_project: msaflow

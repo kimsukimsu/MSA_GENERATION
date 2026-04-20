@@ -415,8 +415,14 @@ def train(cfg):
             }
             if ema is not None:
                 ckpt["ema"] = ema.state_dict()
+            # latest.pt: 매 epoch 덮어씀 (resume용, 단일 파일)
             torch.save(ckpt, output_dir / "latest.pt")
-            torch.save(ckpt, output_dir / f"epoch_{epoch:03d}.pt")
+            # epoch_NNN.pt: save_checkpoint_every마다만 저장 (기본 1 = 매 epoch)
+            # 오버피팅 디버그처럼 epoch 수가 많을 때는 50 등으로 설정해 디스크 절약
+            save_every = cfg.training.get("save_checkpoint_every", 1)
+            is_last = (epoch == cfg.training.epochs - 1)
+            if (epoch + 1) % save_every == 0 or is_last:
+                torch.save(ckpt, output_dir / f"epoch_{epoch:03d}.pt")
             avg_loss = epoch_loss.item() / len(loader)
             logger.info(
                 "Epoch %d complete | avg loss %.4f",
