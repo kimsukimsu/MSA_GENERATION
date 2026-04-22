@@ -255,6 +255,12 @@ def run_benchmark(args):
     proteins = parse_fasta(args.fasta)
     logger.info("Loaded %d proteins from %s", len(proteins), args.fasta)
 
+    # ── Shard the protein list across parallel workers ─────────────────────────
+    if args.num_shards > 1:
+        proteins = proteins[args.shard_id :: args.num_shards]
+        logger.info("Shard %d/%d: processing %d proteins",
+                    args.shard_id, args.num_shards, len(proteins))
+
     results = []
 
     for prot_idx, (prot_name, query_seq) in enumerate(proteins):
@@ -364,7 +370,8 @@ def run_benchmark(args):
         })
 
     # ── Write CSV summary ──────────────────────────────────────────────────────
-    csv_path = output_dir / "benchmark_results.csv"
+    shard_suffix = f"_shard{args.shard_id}" if args.num_shards > 1 else ""
+    csv_path = output_dir / f"shard{shard_suffix}.csv"
     fieldnames = ["name", "seq_len", "plddt", "tm_score", "rmsd", "status"]
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
@@ -424,6 +431,10 @@ def main():
                         help="Re-generate MSAs even if A3M files already exist")
     parser.add_argument("--refold",          action="store_true",
                         help="Re-run Protenix even if CIF output already exists")
+    parser.add_argument("--shard_id",        type=int, default=0,
+                        help="0-based shard index for parallel runs (default: 0)")
+    parser.add_argument("--num_shards",      type=int, default=1,
+                        help="Total number of shards (default: 1 = no sharding)")
     args = parser.parse_args()
 
     run_benchmark(args)
