@@ -113,6 +113,9 @@ def run_protenix(
         "-i", input_json,
         "-o", output_dir,
         "-n", model_name,
+        # Disable fusion CUDA kernel — pre-compiled kernels may not support
+        # newer GPU architectures (e.g. Blackwell/Ada Lovelace sm_89+).
+        "--enable_fusion", "False",
     ]
 
     # Repo root = two levels above this file (msaflow/inference/fold_benchmark.py)
