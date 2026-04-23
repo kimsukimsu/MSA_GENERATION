@@ -14,6 +14,19 @@
 # ── Python 모듈 로드 ───────────────────────────────────────────────────────────
 module load python/3.11.14
 
+# ── CUDA_HOME 설정 (Protenix fast_layer_norm JIT 컴파일에 필요) ────────────────
+if [ -z "$CUDA_HOME" ]; then
+    # nvcc 위치로 자동 감지
+    NVCC_PATH=$(which nvcc 2>/dev/null)
+    if [ -n "$NVCC_PATH" ]; then
+        export CUDA_HOME=$(dirname $(dirname $NVCC_PATH))
+    else
+        export CUDA_HOME=/usr/local/cuda
+    fi
+fi
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+echo "CUDA_HOME      : $CUDA_HOME"
+
 # ── uv PATH ───────────────────────────────────────────────────────────────────
 export PATH="$HOME/.local/bin:$PATH"
 
