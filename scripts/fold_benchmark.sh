@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --nodelist=ada-001
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:6
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
 #SBATCH --time=24:00:00
@@ -68,7 +68,7 @@ echo "Protenix model: $PROTENIX_MODEL"
 echo "n_seeds       : $N_SEEDS (each seed folded separately, best pLDDT reported)"
 date
 
-NUM_SHARDS=4
+NUM_SHARDS=6
 
 REF_ARG=""
 if [ -n "$REF_PDB_DIR" ]; then
@@ -78,7 +78,7 @@ fi
 # ── MSAFlow zero-shot (Section 4.2 protocol) ──────────────────────────────────
 # Each seed generates 32 sequences → fold with Protenix → report best pLDDT.
 echo "=== Launching MSAFlow zero-shot shards ==="
-for SHARD_ID in 0 1 2 3; do
+for SHARD_ID in 0 1 2 3 4 5; do
     CUDA_VISIBLE_DEVICES=$SHARD_ID \
     python $REPO_DIR/msaflow/inference/fold_benchmark.py \
         --fasta          $FASTA \
@@ -105,7 +105,7 @@ echo "MSAFlow zero-shot done: $(date)"
 
 # ── No-MSA baseline ────────────────────────────────────────────────────────────
 echo "=== Launching No-MSA baseline shards ==="
-for SHARD_ID in 0 1 2 3; do
+for SHARD_ID in 0 1 2 3 4 5; do
     CUDA_VISIBLE_DEVICES=$SHARD_ID \
     python $REPO_DIR/msaflow/inference/fold_benchmark.py \
         --fasta          $FASTA \
