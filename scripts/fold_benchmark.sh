@@ -32,12 +32,18 @@ N_STEPS=${N_STEPS:-100}    # ODE steps
 TEMPERATURE=${TEMPERATURE:-0.0}
 
 PROTENIX_MODEL=${PROTENIX_MODEL:-protenix_base_default_v1.0.0}
+# Protenix looks for checkpoints under $PROTENIX_ROOT_DIR/checkpoint/
+export PROTENIX_ROOT_DIR=${PROTENIX_ROOT_DIR:-$REPO_DIR}
 
 # ── 환경 활성화 ────────────────────────────────────────────────────────────────
 source $REPO_DIR/.venv/bin/activate
 
 # ── Protenix 경로 추가 ─────────────────────────────────────────────────────────
-export PYTHONPATH=$REPO_DIR/Protenix:$REPO_DIR:$PYTHONPATH
+# NOTE: $REPO_DIR is intentionally omitted here — including it would put the
+# local esm/ submodule on PYTHONPATH and shadow the installed fair-esm package,
+# causing "AttributeError: module 'esm' has no attribute 'data'" in Protenix.
+# fold_benchmark.py adds $REPO_DIR to sys.path at import time for its own use.
+export PYTHONPATH=$REPO_DIR/Protenix:$PYTHONPATH
 
 # ── 로그 디렉터리 ──────────────────────────────────────────────────────────────
 mkdir -p $OUTPUT_DIR $REPO_DIR/logs

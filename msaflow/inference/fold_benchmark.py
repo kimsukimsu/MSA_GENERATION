@@ -100,18 +100,39 @@ def run_protenix(
     model_name: str = "protenix_base_default_v1.0.0",
     protenix_dir: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
-    """Invoke `protenix pred` as a subprocess."""
+    """Invoke `protenix pred` as a subprocess.
+
+    Builds a clean PYTHONPATH that strips the MSA_FLOW repo root so that the
+    local esm/ submodule does not shadow the installed fair-esm package and
+    cause "AttributeError: module 'esm' has no attribute 'data'".
+    """
+    import os
+
     cmd = [
         "protenix", "pred",
         "-i", input_json,
         "-o", output_dir,
         "-n", model_name,
     ]
-    env = None
-    if protenix_dir:
-        import os
-        env = os.environ.copy()
-        env["PYTHONPATH"] = f"{protenix_dir}:{env.get('PYTHONPATH', '')}"
+
+    # Repo root = two levels above this file (msaflow/inference/fold_benchmark.py)
+    repo_root = str(Path(__file__).parents[2].resolve())
+    protenix_root = str((Path(__file__).parents[2] / "Protenix").resolve())
+
+    # Strip $REPO_DIR from PYTHONPATH — it exposes the local esm/ submodule
+    # which shadows the installed fair-esm package inside Protenix subprocess.
+    old_path = os.environ.get("PYTHONPATH", "")
+    clean_paths = [
+        p for p in old_path.split(os.pathsep)
+        if p and p.rstrip("/") != repo_root.rstrip("/")
+    ]
+    if protenix_root not in clean_paths:
+        clean_paths.insert(0, protenix_root)
+    if protenix_dir and protenix_dir not in clean_paths:
+        clean_paths.insert(0, protenix_dir)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(clean_paths)
 
     logger.info("Running: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
