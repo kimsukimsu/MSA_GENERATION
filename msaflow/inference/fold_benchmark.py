@@ -113,9 +113,12 @@ def run_protenix(
         "-i", input_json,
         "-o", output_dir,
         "-n", model_name,
-        # Disable fusion CUDA kernel — pre-compiled kernels may not support
-        # newer GPU architectures (e.g. Blackwell/Ada Lovelace sm_89+).
-        "--enable_fusion", "False",
+        # Disable all custom CUDA kernels — fall back to pure PyTorch.
+        # Required when cuequivariance / fast_layer_norm are not compiled
+        # for the current GPU architecture.
+        "--enable_fusion",  "False",
+        "--trimul_kernel",  "torch",
+        "--triatt_kernel",  "torch",
     ]
 
     # Repo root = two levels above this file (msaflow/inference/fold_benchmark.py)
