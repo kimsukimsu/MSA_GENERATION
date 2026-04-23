@@ -77,7 +77,7 @@ def load_latent_fm(checkpoint_path: str, device: torch.device) -> LatentFMEncode
 
 
 def load_esm2(device: torch.device):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "esm"))
+    sys.path.insert(0, str(Path(__file__).parents[2] / "esm"))
     import esm as esm_lib
     model, alphabet = esm_lib.pretrained.esm2_t33_650M_UR50D()
     return model.eval().to(device), alphabet
