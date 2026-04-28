@@ -269,7 +269,13 @@ class SFMDecoder(nn.Module):
             h = block(h, cond)
 
         # Final projection back to vocab space
-        return self.final_layer(h, cond)                         # (B, L, vocab_size)
+        v = self.final_layer(h, cond)                            # (B, L, vocab_size)
+
+        # Project onto tangent space at x_t: remove radial component
+        # v_tangent = v - <v, x_t> * x_t
+        x_t_f32 = x_t.float()
+        v_tangent = v.float() - (v.float() * x_t_f32).sum(dim=-1, keepdim=True) * x_t_f32
+        return v_tangent.to(v.dtype)                             # (B, L, vocab_size)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
