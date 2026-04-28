@@ -3,8 +3,8 @@
 #SBATCH --nodes=1
 #SBATCH --nodelist=ada-001
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:5
-#SBATCH --cpus-per-task=28
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=0
 #SBATCH --time=24:00:00
 #SBATCH --partition=normal
@@ -50,11 +50,11 @@ echo "Ref CIF dir   : $REF_CIF_DIR"
 echo "n_seqs=$N_SEQS  n_seeds=$N_SEEDS  n_steps=$N_STEPS  temperature=$TEMPERATURE"
 date
 
-NUM_SHARDS=5
+NUM_SHARDS=4
 
-# ── MSAFlow zero-shot (5 GPU 병렬, GPU 1–5 할당) ─────────────────────────────
+# ── MSAFlow zero-shot (4 GPU 병렬, GPU 1,2,4,5 할당) ─────────────────────────
 echo "=== Launching MSAFlow zero-shot shards ==="
-for SHARD_ID in 0 1 2 3 4; do
+for SHARD_ID in 0 1 2 3; do
     CUDA_VISIBLE_DEVICES=$SHARD_ID \
     python $REPO_DIR/msaflow/inference/fold_benchmark.py \
         --fasta          $FASTA \
