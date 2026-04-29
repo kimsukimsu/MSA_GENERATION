@@ -22,7 +22,7 @@ REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
 DECODER_CKPT=/gpfs/deepfold/users/yjlee4/decoder/latest.pt
 LATENT_FM_CKPT=${LATENT_FM_CKPT:-$REPO_DIR/runs/latent_fm/latent_fm_ema_final.pt}
 FASTA=${FASTA:-$REPO_DIR/data/foldbench_monomer.fasta}
-OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/fold_benchmark_yjlee4_latest}
+export OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/fold_benchmark_yjlee4_latest}
 REF_CIF_DIR=/gpfs/deepfold/users/paul3875/foldbench_ground_truths/ground_truth_20250520
 USALIGN_BIN=${USALIGN_BIN:-USalign}
 
