@@ -121,14 +121,22 @@ def x_fraction(seqs: list[str]) -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def find_gen_a3m(gen_dir: Path, target: str) -> str | None:
-    """Generated: <gen_dir>/<target>/seed_<n>.a3m  — pick first available seed."""
-    prot_dir = gen_dir / target
-    for seed in range(10):
-        p = prot_dir / f"seed_{seed}.a3m"
-        if p.exists():
-            return str(p)
-    matches = sorted(prot_dir.glob("*.a3m")) if prot_dir.exists() else []
-    return str(matches[0]) if matches else None
+    """Generated: <gen_dir>/<target>/seed_<n>.a3m  — pick first available seed.
+
+    Tries both <target> and <target>-assembly1 subdirectory names.
+    """
+    pdb_id = target.split("-")[0]
+    candidates = [target, f"{pdb_id}-assembly1", pdb_id]
+    for name in candidates:
+        prot_dir = gen_dir / name
+        for seed in range(10):
+            p = prot_dir / f"seed_{seed}.a3m"
+            if p.exists():
+                return str(p)
+        matches = sorted(prot_dir.glob("*.a3m")) if prot_dir.exists() else []
+        if matches:
+            return str(matches[0])
+    return None
 
 
 def find_ref_a3m(ref_dir: Path, target: str) -> str | None:
