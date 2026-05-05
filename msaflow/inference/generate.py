@@ -84,13 +84,40 @@ def load_esm2(device: torch.device):
 
 
 def load_protenix(checkpoint_path: str, device: torch.device):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "Protenix"))
+    """Load Protenix using its Python-based config system (no config.yaml needed)."""
+    from collections.abc import Mapping
+
+    protenix_root = str(Path(__file__).parents[3] / "Protenix")
+    runner_dir    = str(Path(protenix_root) / "runner")
+    for d in [protenix_root, runner_dir]:
+        if d not in sys.path:
+            sys.path.insert(0, d)
+
     from protenix.model.protenix import Protenix
-    from omegaconf import OmegaConf
-    cfg = OmegaConf.load(Path(checkpoint_path).parent / "config.yaml")
+    from protenix.config.config import parse_configs
+    from configs.configs_base import configs as configs_base
+    from configs.configs_data import data_configs
+    from configs.configs_inference import inference_configs
+    from configs.configs_model_type import model_configs
+
+    def _deep_update(d: dict, u: dict) -> dict:
+        for k, v in u.items():
+            if isinstance(v, Mapping) and isinstance(d.get(k), Mapping):
+                _deep_update(d[k], v)
+            else:
+                d[k] = v
+        return d
+
+    model_name = Path(checkpoint_path).stem   # e.g. protenix_base_default_v1.0.0
+    base = {**configs_base, **{"data": data_configs}, **inference_configs}
+    if model_name in model_configs:
+        _deep_update(base, model_configs[model_name])
+
+    cfg = parse_configs(configs=base, arg_str=None, fill_required_with_null=True)
+
     model = Protenix(cfg).eval().to(device)
-    state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state["model"], strict=False)
+    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(state.get("model", state), strict=False)
     return model
 
 
