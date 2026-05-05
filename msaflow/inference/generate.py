@@ -208,6 +208,7 @@ def augment_shallow(
     n_diverse: int = 16,
     n_steps: int = 100,
     temperature: float = 0.5,
+    max_rec_depth: int = 128,
     device: torch.device = None,
 ) -> list[str]:
     """
@@ -233,6 +234,8 @@ def augment_shallow(
         n_diverse:        Most diverse sequences to keep (paper: 16).
         n_steps:          ODE integration steps.
         temperature:      SDE temperature for latent FM (paper: 0.5).
+        max_rec_depth:    Max sequences fed to Protenix MSAModule for Rec track.
+                          Subsamples randomly if exceeded (prevents OOM for full MSAs).
         device:           Compute device.
 
     Returns:
@@ -268,9 +271,18 @@ def augment_shallow(
         )
         generated_seqs.extend(syn_seqs)
 
-    # ── Reconstruction track (Rec): from shallow MSA embedding ───────────────
-    logger.info("Rec track  ----- %d seqs from shallow MSA embedding", n_rec_seqs)
-    m_seq = extract_msa_embedding_protenix(shallow_seqs, protenix_model, device)   # (L, 128)
+    # ── Reconstruction track (Rec): from MSA embedding ───────────────────────
+    # Subsample to max_rec_depth to prevent OOM on large MSAs (e.g. full ColabFold)
+    rec_seqs_input = shallow_seqs
+    if len(shallow_seqs) > max_rec_depth:
+        rng = np.random.default_rng(0)
+        chosen = rng.choice(len(shallow_seqs) - 1, max_rec_depth - 1, replace=False) + 1
+        rec_seqs_input = [shallow_seqs[0]] + [shallow_seqs[i] for i in sorted(chosen)]
+        logger.info("Rec track  ----- subsampled %d → %d seqs for MSA encoder",
+                    len(shallow_seqs), len(rec_seqs_input))
+
+    logger.info("Rec track  ----- %d seqs from MSA embedding (generating %d)", len(rec_seqs_input), n_rec_seqs)
+    m_seq = extract_msa_embedding_protenix(rec_seqs_input, protenix_model, device)   # (L, 128)
     rec_seqs = decode_from_embedding(
         decoder, m_seq, n_seqs=n_rec_seqs, n_steps=n_steps,
         temperature=temperature, device=device

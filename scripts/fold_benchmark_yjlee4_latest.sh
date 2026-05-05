@@ -52,7 +52,16 @@ date
 
 NUM_SHARDS=4
 
-# ── MSAFlow zero-shot (4 GPU 병렬, GPU 1,2,4,5 할당) ─────────────────────────
+# ── USalign 없으면 빌드 (fold 시작 전에 준비) ─────────────────────────────────
+if ! command -v $USALIGN_BIN &> /dev/null; then
+    echo "USalign not found — building from source..."
+    wget -q https://zhanggroup.org/US-align/bin/module/USalign.cpp -O /tmp/USalign.cpp
+    g++ -O3 -ffast-math -lm -o $HOME/.local/bin/USalign /tmp/USalign.cpp
+    USALIGN_BIN=$HOME/.local/bin/USalign
+    echo "Built USalign at $USALIGN_BIN"
+fi
+
+# ── MSAFlow zero-shot (4 GPU 병렬) — TM-score 인라인 계산 ─────────────────────
 echo "=== Launching MSAFlow zero-shot shards ==="
 for SHARD_ID in 0 1 2 3; do
     CUDA_VISIBLE_DEVICES=$SHARD_ID \
@@ -68,6 +77,8 @@ for SHARD_ID in 0 1 2 3; do
         --n_steps        $N_STEPS \
         --temperature    $TEMPERATURE \
         --protenix_model $PROTENIX_MODEL \
+        --ref_cif_dir    $REF_CIF_DIR \
+        --usalign_bin    $USALIGN_BIN \
         --shard_id       $SHARD_ID \
         --num_shards     $NUM_SHARDS \
         > $OUTPUT_DIR/shard_${SHARD_ID}.log 2>&1 &
@@ -77,7 +88,7 @@ echo "Launched shards (PIDs: $(jobs -p))"
 wait
 echo "All shards done: $(date)"
 
-# ── 결과 병합 ──────────────────────────────────────────────────────────────────
+# ── 결과 병합 (TM-score 이미 각 shard CSV에 포함됨) ─────────────────────────────
 python - << 'PYEOF'
 import csv, glob, os
 
@@ -95,33 +106,14 @@ if rows:
         writer = csv.DictWriter(fh, fieldnames=header)
         writer.writeheader()
         writer.writerows(rows)
+    import math
+    tm_vals = [float(r["tm_score"]) for r in rows if r.get("tm_score") not in ("", "nan", None)
+               and not math.isnan(float(r["tm_score"]))]
     print(f"Merged {len(rows)} rows → {out_path}")
+    if tm_vals:
+        print(f"TM-score  n={len(tm_vals)}  mean={sum(tm_vals)/len(tm_vals):.4f}")
 else:
     print(f"No shard CSVs found in {output_dir}")
 PYEOF
-
-# ── USalign 없으면 빌드 ────────────────────────────────────────────────────────
-if ! command -v $USALIGN_BIN &> /dev/null; then
-    echo "USalign not found — building from source..."
-    wget -q https://zhanggroup.org/US-align/bin/module/USalign.cpp -O /tmp/USalign.cpp
-    g++ -static -O3 -ffast-math -lm -o $HOME/.local/bin/USalign /tmp/USalign.cpp
-    USALIGN_BIN=$HOME/.local/bin/USalign
-    echo "Built USalign at $USALIGN_BIN"
-fi
-
-# ── TM-score 계산 ──────────────────────────────────────────────────────────────
-RESULTS_CSV=$OUTPUT_DIR/benchmark_results.csv
-if [ -f "$RESULTS_CSV" ]; then
-    echo "=== Computing TM-scores ==="
-    python $REPO_DIR/scripts/compute_tmscore.py \
-        --results_csv  $RESULTS_CSV \
-        --fold_dir     $OUTPUT_DIR/folds \
-        --ref_cif_dir  $REF_CIF_DIR \
-        --usalign_bin  $USALIGN_BIN \
-        --mode         zeroshot
-else
-    echo "ERROR: $RESULTS_CSV not found — fold benchmark may have failed"
-    exit 1
-fi
 
 echo "All done: $(date)"

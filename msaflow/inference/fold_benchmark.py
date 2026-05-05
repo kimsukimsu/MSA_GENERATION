@@ -106,6 +106,38 @@ def parse_a3m_seqs(path: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MSA file lookup (handles both plain and ColabFold assembly1__chain naming)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_msa_file(msa_dir: str, prot_name: str) -> Optional[str]:
+    """Find an A3M file for prot_name in msa_dir.
+
+    Tries in order:
+      1. {prot_name}.a3m
+      2. {pdbid}-assembly1__A.a3m   (ColabFold naming)
+      3. glob {prot_name}*__A.a3m
+      4. glob {prot_name}*.a3m
+      (and repeats 1-4 for bare pdb_id)
+    """
+    d = Path(msa_dir)
+    pdb_id = prot_name.split("-")[0]
+    for name in [prot_name, pdb_id]:
+        p = d / f"{name}.a3m"
+        if p.exists():
+            return str(p)
+        p = d / f"{name}-assembly1__A.a3m"
+        if p.exists():
+            return str(p)
+        hits = sorted(d.glob(f"{name}*__A.a3m"))
+        if hits:
+            return str(hits[0])
+        hits = sorted(d.glob(f"{name}*.a3m"))
+        if hits:
+            return str(hits[0])
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Protenix input JSON builder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -246,36 +278,50 @@ def find_protenix_output_cif(output_dir: str, name: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TM-score computation
+# TM-score computation via USalign (CIF-native, replaces old TMscore+PDB path)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_tmscore(
-    pred_pdb: str,
-    ref_pdb: str,
-    tmscore_bin: str = "TMscore",
-) -> tuple[float, float]:
-    """Run TMscore binary and return (TM-score, RMSD)."""
+def _find_ref_cif(ref_cif_dir: str, prot_name: str) -> Optional[str]:
+    """Find ground-truth CIF. Tries prot_name and bare pdb_id, with/without -assembly1."""
+    d = Path(ref_cif_dir)
+    pdb_id = prot_name.split("-")[0]
+    for name in [prot_name, pdb_id]:
+        for ext in [".cif", ".cif.gz"]:
+            p = d / f"{name}{ext}"
+            if p.exists():
+                return str(p)
+        hits = list(d.glob(f"{name}*.[Cc][Ii][Ff]*"))
+        if hits:
+            return str(hits[0])
+    return None
+
+
+def _run_usalign(pred_cif: str, ref_cif: str, usalign_bin: str) -> tuple[float, float]:
+    """Run USalign -outfmt 2 and return (TM-score normalised by ref len, RMSD)."""
     try:
         result = subprocess.run(
-            [tmscore_bin, pred_pdb, ref_pdb],
-            capture_output=True, text=True, timeout=60,
+            [usalign_bin, pred_cif, ref_cif, "-outfmt", "2"],
+            capture_output=True, text=True, timeout=120,
         )
-        tm_score, rmsd = float("nan"), float("nan")
         for line in result.stdout.splitlines():
-            if line.startswith("TM-score="):
+            parts = line.split()
+            if len(parts) >= 5 and not line.startswith("#"):
                 try:
-                    tm_score = float(line.split("=")[1].split()[0])
-                except (IndexError, ValueError):
-                    pass
-            if "RMSD of" in line and "aligned" in line:
-                try:
-                    rmsd = float(line.split("RMSD=")[1].split(",")[0].strip())
-                except (IndexError, ValueError):
-                    pass
-        return tm_score, rmsd
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        logger.warning("TMscore failed: %s", exc)
-        return float("nan"), float("nan")
+                    return float(parts[3]), float(parts[4])
+                except ValueError:
+                    continue
+        if result.returncode != 0:
+            logger.warning("USalign exit %d: %s", result.returncode, result.stderr[:200])
+    except FileNotFoundError:
+        logger.error("USalign binary not found: %s", usalign_bin)
+    except subprocess.TimeoutExpired:
+        logger.warning("USalign timed out for %s", pred_cif)
+    return float("nan"), float("nan")
+
+
+def compute_tmscore(pred_cif: str, ref_cif: str, usalign_bin: str = "USalign") -> tuple[float, float]:
+    """Thin wrapper kept for call-site compatibility."""
+    return _run_usalign(pred_cif, ref_cif, usalign_bin)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,8 +406,8 @@ def run_benchmark(args):
     msa_dir.mkdir(exist_ok=True)
     fold_dir.mkdir(exist_ok=True)
 
-    # ── Load models (skip in nomsa baseline mode) ──────────────────────────────
-    if mode != "nomsa":
+    # ── Load models (skip in nomsa / colabfold baseline modes) ────────────────
+    if mode not in ("nomsa", "colabfold"):
         logger.info("Loading SFM decoder from %s", args.decoder_ckpt)
         sys.path.insert(0, str(Path(__file__).parents[2]))
         from msaflow.inference.generate import (
@@ -383,6 +429,8 @@ def run_benchmark(args):
                 "--protenix_ckpt not provided; few-shot will run Syn track only "
                 "(no Rec track from shallow MSA embedding)."
             )
+    elif mode == "colabfold":
+        logger.info("ColabFold direct fold mode: skipping MSA model loading.")
 
         logger.info("All models loaded.")
     else:
@@ -451,12 +499,10 @@ def run_benchmark(args):
             logger.info("  Best seed=%d  pLDDT=%.2f", best_seed, best_plddt)
 
             tm_score, rmsd = float("nan"), float("nan")
-            if args.ref_pdb_dir and best_cif:
-                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
-                if not ref_pdb.exists():
-                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
-                if ref_pdb.exists():
-                    tm_score, rmsd = compute_tmscore(best_cif, str(ref_pdb), args.tmscore_bin)
+            if args.ref_cif_dir and best_cif:
+                ref_cif = _find_ref_cif(args.ref_cif_dir, prot_name)
+                if ref_cif:
+                    tm_score, rmsd = _run_usalign(best_cif, ref_cif, args.usalign_bin)
                     logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
 
             results.append({
@@ -466,19 +512,55 @@ def run_benchmark(args):
                 "status": "ok" if not np.isnan(best_plddt) else "failed",
             })
 
+        # ── ColabFold direct fold (no generation) ─────────────────────────────
+        elif mode == "colabfold":
+            ref_a3m = _find_msa_file(args.shallow_msa_dir, prot_name) if args.shallow_msa_dir else None
+            if ref_a3m is None:
+                logger.warning("  ColabFold A3M not found for %s — skipping", prot_name)
+                results.append({
+                    "name": prot_name, "seq_len": len(query_seq),
+                    "plddt": float("nan"), "best_seed": -1,
+                    "tm_score": float("nan"), "rmsd": float("nan"),
+                    "status": "ref_a3m_missing",
+                })
+                continue
+            logger.info("  ColabFold MSA: %s", ref_a3m)
+            plddt, cif = fold_once(
+                prot_name=prot_name,
+                query_seq=query_seq,
+                a3m_path=Path(ref_a3m),
+                fold_dir=fold_dir,
+                args=args,
+                use_msa=True,
+                tag="_colabfold",
+            )
+            logger.info("  pLDDT=%.2f", plddt)
+            tm_score, rmsd = float("nan"), float("nan")
+            if args.ref_cif_dir and cif:
+                ref_cif = _find_ref_cif(args.ref_cif_dir, prot_name)
+                if ref_cif:
+                    tm_score, rmsd = _run_usalign(cif, ref_cif, args.usalign_bin)
+                    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
+            results.append({
+                "name": prot_name, "seq_len": len(query_seq),
+                "plddt": plddt, "best_seed": -1,
+                "tm_score": tm_score, "rmsd": rmsd,
+                "status": "ok" if not np.isnan(plddt) else "failed",
+            })
+
         # ── Few-shot: augment shallow MSA, fold once ───────────────────────────
         elif mode == "fewshot":
             # Load shallow MSA for this target
             shallow_seqs = None
             if args.shallow_msa_dir:
-                shallow_a3m = Path(args.shallow_msa_dir) / f"{prot_name}.a3m"
-                if shallow_a3m.exists():
-                    shallow_seqs = parse_a3m_seqs(str(shallow_a3m))
+                shallow_a3m = _find_msa_file(args.shallow_msa_dir, prot_name)
+                if shallow_a3m:
+                    shallow_seqs = parse_a3m_seqs(shallow_a3m)
                     logger.info("  Loaded shallow MSA: %d seqs from %s",
                                 len(shallow_seqs), shallow_a3m)
                 else:
-                    logger.warning("  Shallow A3M not found: %s; using depth-1 (query only)",
-                                   shallow_a3m)
+                    logger.warning("  Shallow A3M not found for %s; using depth-1 (query only)",
+                                   prot_name)
 
             if not shallow_seqs:
                 # Depth-1 MSA = query sequence only (ungapped, aligned to itself)
@@ -504,6 +586,7 @@ def run_benchmark(args):
                         n_diverse=16,
                         n_steps=args.n_steps,
                         temperature=args.temperature,
+                        max_rec_depth=args.max_rec_depth,
                         device=device,
                     )
                     write_a3m(query_seq, aug_seqs, str(aug_a3m), prefix=prot_name)
@@ -530,12 +613,10 @@ def run_benchmark(args):
             logger.info("  pLDDT=%.2f", plddt)
 
             tm_score, rmsd = float("nan"), float("nan")
-            if args.ref_pdb_dir and cif:
-                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
-                if not ref_pdb.exists():
-                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
-                if ref_pdb.exists():
-                    tm_score, rmsd = compute_tmscore(cif, str(ref_pdb), args.tmscore_bin)
+            if args.ref_cif_dir and cif:
+                ref_cif = _find_ref_cif(args.ref_cif_dir, prot_name)
+                if ref_cif:
+                    tm_score, rmsd = _run_usalign(cif, ref_cif, args.usalign_bin)
                     logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
 
             results.append({
@@ -559,12 +640,10 @@ def run_benchmark(args):
             logger.info("  pLDDT=%.2f", plddt)
 
             tm_score, rmsd = float("nan"), float("nan")
-            if args.ref_pdb_dir and cif:
-                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
-                if not ref_pdb.exists():
-                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
-                if ref_pdb.exists():
-                    tm_score, rmsd = compute_tmscore(cif, str(ref_pdb), args.tmscore_bin)
+            if args.ref_cif_dir and cif:
+                ref_cif = _find_ref_cif(args.ref_cif_dir, prot_name)
+                if ref_cif:
+                    tm_score, rmsd = _run_usalign(cif, ref_cif, args.usalign_bin)
                     logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
 
             results.append({
@@ -618,10 +697,10 @@ def main():
     parser.add_argument("--output_dir",      required=True,
                         help="Root directory for MSA files, fold outputs, and CSV")
     parser.add_argument("--mode",            default="zeroshot",
-                        choices=["zeroshot", "fewshot", "nomsa"],
-                        help="Generation mode: zeroshot | fewshot | nomsa (default: zeroshot)")
-    parser.add_argument("--ref_pdb_dir",     default=None,
-                        help="Directory with reference PDB files named {name}.pdb")
+                        choices=["zeroshot", "fewshot", "nomsa", "colabfold"],
+                        help="Generation mode: zeroshot | fewshot | nomsa | colabfold (default: zeroshot)")
+    parser.add_argument("--ref_cif_dir",     default=None,
+                        help="Directory with ground-truth CIF files (USalign TM-score inline)")
     parser.add_argument("--device",          default="cuda")
     parser.add_argument("--n_seqs",          type=int, default=32,
                         help="Sequences per seed")
@@ -633,13 +712,17 @@ def main():
                         help="SDE temperature (paper: 0.5)")
     parser.add_argument("--protenix_model",  default="protenix_base_default_v1.0.0",
                         help="Protenix model name for structure prediction")
-    parser.add_argument("--tmscore_bin",     default="TMscore",
-                        help="Path or name of TMscore binary")
-    # Few-shot specific
+    parser.add_argument("--usalign_bin",     default="USalign",
+                        help="Path to USalign binary (used for inline TM-score computation)")
+    # Few-shot / colabfold specific
     parser.add_argument("--shallow_msa_dir", default=None,
-                        help="[fewshot] Directory with shallow A3M files named {target}.a3m")
+                        help="[fewshot|colabfold] Directory with A3M files. "
+                             "Tries {target}.a3m then {pdbid}-assembly1__A.a3m (ColabFold naming).")
     parser.add_argument("--protenix_ckpt",   default=None,
                         help="[fewshot] Protenix .pt checkpoint for Rec track MSA embedding")
+    parser.add_argument("--max_rec_depth",   type=int, default=128,
+                        help="[fewshot] Max sequences fed to Protenix MSA encoder "
+                             "(subsampled randomly if exceeded; prevents OOM on full MSAs)")
     # Parallelism
     parser.add_argument("--shard_id",        type=int, default=0,
                         help="0-based shard index for parallel runs (default: 0)")
