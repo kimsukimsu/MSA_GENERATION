@@ -1,0 +1,114 @@
+#!/bin/bash
+#SBATCH --job-name=msaflow-colabfold
+#SBATCH --nodes=1
+#SBATCH --nodelist=ada-001
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=0
+#SBATCH --time=24:00:00
+#SBATCH --partition=normal
+#SBATCH --output=logs/colabfold_%j.out
+#SBATCH --error=logs/colabfold_%j.err
+
+module load python/3.11.14
+module load cuda/13.0.2
+
+export CUDA_HOME=${CUDA_HOME:-$(dirname $(dirname $(which nvcc)))}
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export PATH="$HOME/.local/bin:$PATH"
+
+REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
+FASTA=${FASTA:-$REPO_DIR/data/foldbench_monomer.fasta}
+export OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/fold_benchmark_colabfold}
+SHALLOW_MSA_DIR=${SHALLOW_MSA_DIR:-/store/deepfold3/results/msa/a3m}
+REF_CIF_DIR=${REF_CIF_DIR:-/gpfs/deepfold/users/paul3875/foldbench_ground_truths/ground_truth_20250520}
+USALIGN_BIN=${USALIGN_BIN:-USalign}
+
+PROTENIX_MODEL=${PROTENIX_MODEL:-protenix_base_default_v1.0.0}
+export PROTENIX_ROOT_DIR=${PROTENIX_ROOT_DIR:-$REPO_DIR}
+
+# colabfold 모드는 MSA 생성 없음 — dummy 값 (사용 안 함)
+DUMMY_CKPT=$REPO_DIR/runs/latent_fm/latent_fm_ema_final.pt
+
+source $REPO_DIR/.venv/bin/activate
+export PYTHONPATH=$REPO_DIR/Protenix:$PYTHONPATH
+
+mkdir -p $OUTPUT_DIR $REPO_DIR/logs
+
+echo "Job ID        : $SLURM_JOB_ID"
+echo "Node          : $SLURMD_NODENAME"
+echo "Python        : $(python --version)"
+echo "FASTA         : $FASTA"
+echo "Shallow MSA   : $SHALLOW_MSA_DIR"
+echo "Output dir    : $OUTPUT_DIR"
+echo "Ref CIF dir   : $REF_CIF_DIR"
+echo "Mode          : colabfold (direct fold, no MSA generation)"
+date
+
+# ── USalign 빌드 (없으면) ──────────────────────────────────────────────────────
+if ! command -v $USALIGN_BIN &> /dev/null; then
+    echo "USalign not found — building from source..."
+    wget -q https://zhanggroup.org/US-align/bin/module/USalign.cpp -O /tmp/USalign.cpp
+    g++ -O3 -ffast-math -lm -o $HOME/.local/bin/USalign /tmp/USalign.cpp
+    USALIGN_BIN=$HOME/.local/bin/USalign
+    echo "Built USalign at $USALIGN_BIN"
+fi
+
+NUM_SHARDS=4
+
+# ── ColabFold direct fold (4 GPU 병렬) ────────────────────────────────────────
+# ColabFold ref A3M → Protenix fold (MSA 생성 없음)
+# Upper bound baseline: "ColabFold MSA만 써서 fold하면 얼마나 좋은가?"
+echo "=== Launching ColabFold direct fold shards ==="
+for SHARD_ID in 0 1 2 3; do
+    CUDA_VISIBLE_DEVICES=$SHARD_ID \
+    python $REPO_DIR/msaflow/inference/fold_benchmark.py \
+        --fasta          $FASTA \
+        --decoder_ckpt   $DUMMY_CKPT \
+        --latent_fm_ckpt $DUMMY_CKPT \
+        --output_dir     $OUTPUT_DIR \
+        --mode           colabfold \
+        --device         cuda \
+        --protenix_model $PROTENIX_MODEL \
+        --shallow_msa_dir $SHALLOW_MSA_DIR \
+        --ref_cif_dir    $REF_CIF_DIR \
+        --usalign_bin    $USALIGN_BIN \
+        --shard_id       $SHARD_ID \
+        --num_shards     $NUM_SHARDS \
+        > $OUTPUT_DIR/shard_${SHARD_ID}.log 2>&1 &
+done
+
+echo "Launched shards (PIDs: $(jobs -p))"
+wait
+echo "All shards done: $(date)"
+
+# ── 결과 병합 ──────────────────────────────────────────────────────────────────
+python - << 'PYEOF'
+import csv, glob, os, math
+
+output_dir = os.environ["OUTPUT_DIR"]
+rows, header = [], None
+for shard_csv in sorted(glob.glob(f"{output_dir}/shard_*.csv")):
+    with open(shard_csv) as fh:
+        reader = csv.DictReader(fh)
+        if header is None:
+            header = reader.fieldnames
+        rows.extend(reader)
+if rows:
+    out_path = f"{output_dir}/benchmark_results.csv"
+    with open(out_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        writer.writerows(rows)
+    tm_vals = [float(r["tm_score"]) for r in rows
+               if r.get("tm_score") not in ("", "nan", None)
+               and not math.isnan(float(r["tm_score"]))]
+    print(f"Merged {len(rows)} rows → {out_path}")
+    if tm_vals:
+        print(f"TM-score  n={len(tm_vals)}  mean={sum(tm_vals)/len(tm_vals):.4f}")
+else:
+    print(f"No shard CSVs found in {output_dir}")
+PYEOF
+
+echo "All done: $(date)"
