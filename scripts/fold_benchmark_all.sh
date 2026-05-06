@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=msaflow-all
 #SBATCH --nodes=1
-#SBATCH --nodelist=ada-001
+#SBATCH --nodelist=ada-004
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
