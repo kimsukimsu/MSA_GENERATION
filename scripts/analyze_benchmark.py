@@ -1,46 +1,48 @@
 """
-Grouped comparison of fold benchmark results across 4 modes.
+Grouped comparison of fold benchmark results.
 
-Reads:
-  --base_dir  DIR   base directory containing nomsa/ colabfold/ zeroshot/ fewshot/
-                    subdirs, each with benchmark_results.csv
-  --neff_csv  CSV   neff_scores.csv from compute_foldbench_neff.py
-                    columns: name, neff, depth, group
+Comparison design:
+  orphan  (Neff ≤ 10)         : nomsa  vs  zeroshot
+  shallow (10 < Neff ≤ 67.1)  : colabfold  vs  fewshot
+  full    (Neff > 67.1)        : colabfold  vs  fewshot
 
-Prints a table:  group × mode → mean TM-score, mean pLDDT, count
+Usage:
+  python scripts/analyze_benchmark.py --base_dir runs/benchmark_all --neff_csv data/foldbench_groups/neff_scores.csv
 """
 
 import argparse
 import csv
+import glob
 import math
-import sys
-from collections import defaultdict
 from pathlib import Path
 
-MODES   = ["nomsa", "colabfold", "zeroshot", "fewshot"]
-GROUPS  = ["orphan", "shallow", "full", "all"]
-SEP     = "─"
+SEP = "─"
+
+GROUP_MODES = {
+    "orphan":  ["nomsa", "zeroshot"],
+    "shallow": ["colabfold", "fewshot"],
+    "full":    ["colabfold", "fewshot"],
+}
+ALL_MODES = ["nomsa", "zeroshot", "colabfold", "fewshot"]
 
 
 def load_neff_groups(csv_path: Path) -> dict[str, str]:
-    """Return {protein_name: group} from neff_scores.csv."""
     groups = {}
     with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            groups[row["name"]] = row["group"]   # orphan / shallow / full / missing
+        for row in csv.DictReader(f):
+            groups[row["name"]] = row["group"]
     return groups
 
 
-def load_results(csv_path: Path) -> list[dict]:
-    """Return list of rows from benchmark_results.csv; skip empty TM-scores."""
+def load_results(mode_dir: Path) -> list[dict]:
+    csv_path = mode_dir / "benchmark_results.csv"
+    if csv_path.exists():
+        with open(csv_path) as f:
+            return list(csv.DictReader(f))
     rows = []
-    if not csv_path.exists():
-        return rows
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
+    for sf in sorted(glob.glob(str(mode_dir / "shard_*.csv"))):
+        with open(sf) as f:
+            rows.extend(csv.DictReader(f))
     return rows
 
 
@@ -53,13 +55,18 @@ def safe_float(v) -> float | None:
 
 
 def stats(values: list[float]) -> tuple[float, float, int]:
-    """Return (mean, std, n)."""
     n = len(values)
     if n == 0:
         return float("nan"), float("nan"), 0
     mean = sum(values) / n
-    var  = sum((x - mean) ** 2 for x in values) / n if n > 1 else 0.0
+    var = sum((x - mean) ** 2 for x in values) / n if n > 1 else 0.0
     return mean, math.sqrt(var), n
+
+
+def fmt_cell(mean, std, n, width=26):
+    if n == 0:
+        return "  —".ljust(width)
+    return f"  {mean:.4f} ± {std:.4f}  (n={n})".ljust(width)
 
 
 def main():
@@ -71,116 +78,78 @@ def main():
     base_dir = Path(args.base_dir)
     neff_groups = load_neff_groups(Path(args.neff_csv))
 
-    # ── Load all results ──────────────────────────────────────────────────────
     # data[mode][group] = {tm: [], plddt: []}
-    data: dict[str, dict[str, dict[str, list[float]]]] = {
-        mode: {g: {"tm": [], "plddt": []} for g in GROUPS}
-        for mode in MODES
+    data: dict[str, dict[str, dict]] = {
+        mode: {g: {"tm": [], "plddt": []} for g in ["orphan", "shallow", "full"]}
+        for mode in ALL_MODES
     }
 
-    for mode in MODES:
-        csv_path = base_dir / mode / "benchmark_results.csv"
-        rows = load_results(csv_path)
-        if not rows:
-            # try shard CSVs if benchmark_results.csv not yet merged
-            import glob
-            shard_files = sorted(glob.glob(str(base_dir / mode / "shard_*.csv")))
-            for sf in shard_files:
-                rows.extend(load_results(Path(sf)))
-
-        for row in rows:
-            name  = row.get("name", row.get("protein", ""))
+    for mode in ALL_MODES:
+        for row in load_results(base_dir / mode):
+            name = row.get("name", row.get("protein", ""))
             group = neff_groups.get(name, "missing")
-            if group == "missing":
+            if group not in data[mode]:
                 continue
-
             tm    = safe_float(row.get("tm_score", ""))
-            plddt = safe_float(row.get("plddt",    ""))
+            plddt = safe_float(row.get("plddt", ""))
+            if tm    is not None: data[mode][group]["tm"].append(tm)
+            if plddt is not None: data[mode][group]["plddt"].append(plddt)
 
-            for g in [group, "all"]:
-                if tm    is not None:
-                    data[mode][g]["tm"].append(tm)
-                if plddt is not None:
-                    data[mode][g]["plddt"].append(plddt)
+    W = 28  # column width
 
-    # ── Print table ───────────────────────────────────────────────────────────
-    col_w = 22
-    hdr_w = 10
+    def section(title, metric_key, label):
+        print(f"\n{'='*80}")
+        print(f"  {title}")
+        print(f"{'='*80}")
 
-    def fmt(mean, std, n):
-        if n == 0:
-            return "  n/a".ljust(col_w)
-        return f"  {mean:.4f} ± {std:.4f}  (n={n})".ljust(col_w)
-
-    # TM-score table
-    print()
-    print("=" * 80)
-    print("  TM-score comparison  (mean ± std)")
-    print("=" * 80)
-    header = f"  {'Group':<{hdr_w}}" + "".join(f"  {m:<{col_w-2}}" for m in MODES)
-    print(header)
-    print("  " + SEP * (hdr_w + len(MODES) * col_w))
-    for g in GROUPS:
-        row_str = f"  {g:<{hdr_w}}"
-        for mode in MODES:
-            tm_vals = data[mode][g]["tm"]
-            m, s, n = stats(tm_vals)
-            row_str += fmt(m, s, n)
+        # orphan block
+        modes_o = GROUP_MODES["orphan"]
+        header_o = f"  {'Group':<10}" + "".join(f"  {m:<{W-2}}" for m in modes_o)
+        print(header_o)
+        print("  " + SEP * (10 + len(modes_o) * W))
+        row_str = f"  {'orphan':<10}"
+        base_val = stats(data[modes_o[0]]["orphan"][metric_key])[0]
+        for i, mode in enumerate(modes_o):
+            m, s, n = stats(data[mode]["orphan"][metric_key])
+            cell = fmt_cell(m, s, n, W)
+            if i > 0 and not math.isnan(base_val) and not math.isnan(m):
+                delta = m - base_val
+                sign = "+" if delta >= 0 else ""
+                cell = cell.rstrip() + f"  (Δ{sign}{delta:.4f})"
+            row_str += cell
         print(row_str)
-    print()
 
-    # pLDDT table
-    print("=" * 80)
-    print("  pLDDT comparison  (mean ± std)")
-    print("=" * 80)
-    print(header)
-    print("  " + SEP * (hdr_w + len(MODES) * col_w))
-    for g in GROUPS:
-        row_str = f"  {g:<{hdr_w}}"
-        for mode in MODES:
-            plddt_vals = data[mode][g]["plddt"]
-            m, s, n = stats(plddt_vals)
-            row_str += fmt(m, s, n)
-        print(row_str)
-    print()
+        # shallow + full block
+        print()
+        modes_sf = GROUP_MODES["shallow"]
+        header_sf = f"  {'Group':<10}" + "".join(f"  {m:<{W-2}}" for m in modes_sf)
+        print(header_sf)
+        print("  " + SEP * (10 + len(modes_sf) * W))
+        for group in ["shallow", "full"]:
+            row_str = f"  {group:<10}"
+            base_val = stats(data[modes_sf[0]][group][metric_key])[0]
+            for i, mode in enumerate(modes_sf):
+                m, s, n = stats(data[mode][group][metric_key])
+                cell = fmt_cell(m, s, n, W)
+                if i > 0 and not math.isnan(base_val) and not math.isnan(m):
+                    delta = m - base_val
+                    sign = "+" if delta >= 0 else ""
+                    cell = cell.rstrip() + f"  (Δ{sign}{delta:.4f})"
+                row_str += cell
+            print(row_str)
 
-    # ── Per-group delta vs nomsa ───────────────────────────────────────────────
-    print("=" * 80)
-    print("  ΔTM-score vs nomsa baseline  (mean)")
-    print("=" * 80)
-    delta_modes = [m for m in MODES if m != "nomsa"]
-    header2 = f"  {'Group':<{hdr_w}}" + "".join(f"  {m:<{col_w-2}}" for m in delta_modes)
-    print(header2)
-    print("  " + SEP * (hdr_w + len(delta_modes) * col_w))
-    for g in GROUPS:
-        row_str = f"  {g:<{hdr_w}}"
-        base_tm  = stats(data["nomsa"][g]["tm"])[0]
-        for mode in delta_modes:
-            cmp_tm = stats(data[mode][g]["tm"])[0]
-            n      = len(data[mode][g]["tm"])
-            if n == 0 or math.isnan(base_tm) or math.isnan(cmp_tm):
-                row_str += "  n/a".ljust(col_w)
-            else:
-                delta = cmp_tm - base_tm
-                sign  = "+" if delta >= 0 else ""
-                row_str += f"  {sign}{delta:.4f}".ljust(col_w)
-        print(row_str)
-    print()
+    section("TM-score", "tm", "TM-score")
+    section("pLDDT", "plddt", "pLDDT")
 
-    # ── Coverage report ───────────────────────────────────────────────────────
-    print("=" * 80)
+    # Coverage
+    print(f"\n{'='*80}")
     print("  Coverage (proteins with TM-score)")
-    print("=" * 80)
-    print(f"  {'Group':<{hdr_w}}" + "".join(f"  {m:<{col_w-2}}" for m in MODES))
-    print("  " + SEP * (hdr_w + len(MODES) * col_w))
-    for g in GROUPS:
-        row_str = f"  {g:<{hdr_w}}"
-        for mode in MODES:
-            n = len(data[mode][g]["tm"])
-            row_str += f"  {n}".ljust(col_w)
-        print(row_str)
-    print("=" * 80)
-    print()
+    print(f"{'='*80}")
+    for group in ["orphan", "shallow", "full"]:
+        modes = GROUP_MODES[group]
+        counts = "  ".join(f"{m}={len(data[m][group]['tm'])}" for m in modes)
+        print(f"  {group:<10}  {counts}")
+    print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":

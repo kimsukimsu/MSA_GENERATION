@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=msaflow-all
 #SBATCH --nodes=1
-#SBATCH --nodelist=ada-004
+#SBATCH --nodelist=ada-003
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
 #SBATCH --time=72:00:00
@@ -11,14 +11,20 @@
 #SBATCH --output=logs/all_%j.out
 #SBATCH --error=logs/all_%j.err
 
-# ── 4-GPU 순차 실행 ────────────────────────────────────────────────────────────
-# 각 모드를 4-GPU shard로 병렬 실행한 뒤 다음 모드로 진행.
-# GPU가 항상 100% 활용됨 (빠른 모드가 끝나도 놀지 않음).
+# ── Neff 그룹별 현실적 비교 설계 ──────────────────────────────────────────────
 #
-# Stage 1: nomsa     (fold only, ~빠름)
-# Stage 2: colabfold (fold only, ~빠름)
-# Stage 3: zeroshot  (Syn 생성 + fold, ~중간)
-# Stage 4: fewshot   (Rec+Syn 생성 + fold, ~느림)
+# orphan  (Neff ≤ 10)   : MSA 자체가 없는 상황
+#                          nomsa  vs  zeroshot
+#
+# shallow (10 < Neff ≤ 67.1) : MSA가 얕게 있는 상황
+# full    (Neff > 67.1)       : MSA가 풍부한 상황
+#                          colabfold  vs  fewshot
+#
+# Stage 순서 (각 stage는 NUM_SHARDS GPU 병렬):
+#   1. nomsa     — foldbench_orphan.fasta
+#   2. zeroshot  — foldbench_orphan.fasta
+#   3. colabfold — foldbench_shallow.fasta + foldbench_full.fasta
+#   4. fewshot   — foldbench_shallow.fasta + foldbench_full.fasta
 
 module load python/3.11.14
 module load cuda/13.0.2
@@ -31,11 +37,11 @@ REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
 DECODER_CKPT=${DECODER_CKPT:-/gpfs/deepfold/users/yjlee4/decoder/latest.pt}
 LATENT_FM_CKPT=${LATENT_FM_CKPT:-$REPO_DIR/runs/latent_fm/latent_fm_ema_final.pt}
 PROTENIX_CKPT=${PROTENIX_CKPT:-$REPO_DIR/checkpoint/protenix_base_default_v1.0.0.pt}
-FASTA=${FASTA:-$REPO_DIR/data/foldbench_monomer.fasta}
 export BASE_DIR=${BASE_DIR:-$REPO_DIR/runs/benchmark_all}
+FASTA_DIR=${FASTA_DIR:-$REPO_DIR/data/foldbench_groups}
 SHALLOW_MSA_DIR=${SHALLOW_MSA_DIR:-/store/deepfold3/results/msa/a3m}
 REF_CIF_DIR=${REF_CIF_DIR:-/gpfs/deepfold/users/paul3875/foldbench_ground_truths/ground_truth_20250520}
-NEFF_CSV=${NEFF_CSV:-$REPO_DIR/data/foldbench_groups/neff_scores.csv}
+NEFF_CSV=${NEFF_CSV:-$FASTA_DIR/neff_scores.csv}
 USALIGN_BIN=${USALIGN_BIN:-USalign}
 
 PROTENIX_MODEL=${PROTENIX_MODEL:-protenix_base_default_v1.0.0}
@@ -46,18 +52,31 @@ N_SEEDS=${N_SEEDS:-5}
 N_STEPS=${N_STEPS:-100}
 TEMPERATURE=${TEMPERATURE:-0.5}
 MAX_REC_DEPTH=${MAX_REC_DEPTH:-128}
+
+# 그룹별 FASTA
+ORPHAN_FASTA=$FASTA_DIR/foldbench_orphan.fasta
+SHALLOW_FASTA=$FASTA_DIR/foldbench_shallow.fasta
+FULL_FASTA=$FASTA_DIR/foldbench_full.fasta
+
 source $REPO_DIR/.venv/bin/activate
 export PYTHONPATH=$REPO_DIR/Protenix:$PYTHONPATH
 
 mkdir -p $BASE_DIR $REPO_DIR/logs
-for MODE in nomsa colabfold zeroshot fewshot; do
+for MODE in nomsa zeroshot colabfold fewshot; do
     mkdir -p $BASE_DIR/$MODE
 done
+
+# shallow + full 합친 FASTA 생성
+SHALLOW_FULL_FASTA=$BASE_DIR/foldbench_shallow_full.fasta
+cat $SHALLOW_FASTA $FULL_FASTA > $SHALLOW_FULL_FASTA
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"
 echo "Base dir : $BASE_DIR"
-echo "FASTA    : $FASTA  ($(grep -c '^>' $FASTA) proteins)"
+echo "orphan   : $(grep -c '^>' $ORPHAN_FASTA) proteins"
+echo "shallow  : $(grep -c '^>' $SHALLOW_FASTA) proteins"
+echo "full     : $(grep -c '^>' $FULL_FASTA) proteins"
+echo "shallow+full: $(grep -c '^>' $SHALLOW_FULL_FASTA) proteins"
 date
 
 # ── USalign 빌드 (없으면) ──────────────────────────────────────────────────────
@@ -99,9 +118,7 @@ PYEOF
 }
 
 # ── SLURM GPU 할당 파싱 + 불량 GPU 제거 ──────────────────────────────────────
-# SLURM이 CUDA_VISIBLE_DEVICES를 "0,1,3,4" 형태로 설정해 줌.
-# 각 GPU를 실제 CUDA 테스트로 검증하고 healthy한 것만 사용.
-IFS=',' read -ra SLURM_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+IFS=',' read -ra SLURM_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1}"
 echo "SLURM allocated GPUs: ${SLURM_GPUS[*]}"
 
 HEALTHY_GPUS=()
@@ -122,29 +139,20 @@ fi
 NUM_SHARDS=${#HEALTHY_GPUS[@]}
 echo "Using GPUs: ${HEALTHY_GPUS[*]}  (NUM_SHARDS=$NUM_SHARDS)"
 
-gpu_for_shard() {
-    echo "${HEALTHY_GPUS[$1]}"
-}
+gpu_for_shard() { echo "${HEALTHY_GPUS[$1]}"; }
 
-# ── 이미 완료된 stage 체크 (resume용) ─────────────────────────────────────────
-# benchmark_results.csv 가 존재하면 해당 stage 스킵.
-# 중간에 실패했을 경우: 해당 모드 디렉토리의 shard_*.csv 와
-# benchmark_results.csv 를 삭제한 뒤 재실행.
-is_done() {
-    local mode_dir=$1
-    [ -s "$mode_dir/benchmark_results.csv" ]
-}
+is_done() { [ -s "$1/benchmark_results.csv" ]; }
 
-# ── Stage 1: nomsa ─────────────────────────────────────────────────────────────
+# ── Stage 1: nomsa (orphan only) ───────────────────────────────────────────────
 echo ""
-echo "=== Stage 1/4: nomsa ($(date)) ==="
+echo "=== Stage 1/4: nomsa — orphan ($(date)) ==="
 if is_done $BASE_DIR/nomsa; then
-    echo "  already done — skipping (delete $BASE_DIR/nomsa/benchmark_results.csv to rerun)"
+    echo "  already done — skipping"
 else
     for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
         CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
-            --fasta          $FASTA \
+            --fasta          $ORPHAN_FASTA \
             --decoder_ckpt   $LATENT_FM_CKPT \
             --latent_fm_ckpt $LATENT_FM_CKPT \
             --output_dir     $BASE_DIR/nomsa \
@@ -162,44 +170,16 @@ else
     merge_shards $BASE_DIR/nomsa
 fi
 
-# ── Stage 2: colabfold ─────────────────────────────────────────────────────────
+# ── Stage 2: zeroshot (orphan only) ────────────────────────────────────────────
 echo ""
-echo "=== Stage 2/4: colabfold ($(date)) ==="
-if is_done $BASE_DIR/colabfold; then
-    echo "  already done — skipping (delete $BASE_DIR/colabfold/benchmark_results.csv to rerun)"
-else
-    for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
-        CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
-        python $REPO_DIR/msaflow/inference/fold_benchmark.py \
-            --fasta           $FASTA \
-            --decoder_ckpt    $LATENT_FM_CKPT \
-            --latent_fm_ckpt  $LATENT_FM_CKPT \
-            --output_dir      $BASE_DIR/colabfold \
-            --mode            colabfold \
-            --protenix_model  $PROTENIX_MODEL \
-            --shallow_msa_dir $SHALLOW_MSA_DIR \
-            --ref_cif_dir     $REF_CIF_DIR \
-            --usalign_bin     $USALIGN_BIN \
-            --device          cuda \
-            --num_shards      $NUM_SHARDS \
-            --shard_id        $SHARD_ID \
-            > $BASE_DIR/colabfold/shard_${SHARD_ID}.log 2>&1 &
-    done
-    wait
-    echo "  colabfold done: $(date)"
-    merge_shards $BASE_DIR/colabfold
-fi
-
-# ── Stage 3: zeroshot ──────────────────────────────────────────────────────────
-echo ""
-echo "=== Stage 3/4: zeroshot ($(date)) ==="
+echo "=== Stage 2/4: zeroshot — orphan ($(date)) ==="
 if is_done $BASE_DIR/zeroshot; then
-    echo "  already done — skipping (delete $BASE_DIR/zeroshot/benchmark_results.csv to rerun)"
+    echo "  already done — skipping"
 else
     for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
         CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
-            --fasta          $FASTA \
+            --fasta          $ORPHAN_FASTA \
             --decoder_ckpt   $DECODER_CKPT \
             --latent_fm_ckpt $LATENT_FM_CKPT \
             --output_dir     $BASE_DIR/zeroshot \
@@ -221,16 +201,44 @@ else
     merge_shards $BASE_DIR/zeroshot
 fi
 
-# ── Stage 4: fewshot ───────────────────────────────────────────────────────────
+# ── Stage 3: colabfold (shallow + full) ────────────────────────────────────────
 echo ""
-echo "=== Stage 4/4: fewshot ($(date)) ==="
-if is_done $BASE_DIR/fewshot; then
-    echo "  already done — skipping (delete $BASE_DIR/fewshot/benchmark_results.csv to rerun)"
+echo "=== Stage 3/4: colabfold — shallow+full ($(date)) ==="
+if is_done $BASE_DIR/colabfold; then
+    echo "  already done — skipping"
 else
     for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
         CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
-            --fasta           $FASTA \
+            --fasta           $SHALLOW_FULL_FASTA \
+            --decoder_ckpt    $LATENT_FM_CKPT \
+            --latent_fm_ckpt  $LATENT_FM_CKPT \
+            --output_dir      $BASE_DIR/colabfold \
+            --mode            colabfold \
+            --protenix_model  $PROTENIX_MODEL \
+            --shallow_msa_dir $SHALLOW_MSA_DIR \
+            --ref_cif_dir     $REF_CIF_DIR \
+            --usalign_bin     $USALIGN_BIN \
+            --device          cuda \
+            --num_shards      $NUM_SHARDS \
+            --shard_id        $SHARD_ID \
+            > $BASE_DIR/colabfold/shard_${SHARD_ID}.log 2>&1 &
+    done
+    wait
+    echo "  colabfold done: $(date)"
+    merge_shards $BASE_DIR/colabfold
+fi
+
+# ── Stage 4: fewshot (shallow + full) ──────────────────────────────────────────
+echo ""
+echo "=== Stage 4/4: fewshot — shallow+full ($(date)) ==="
+if is_done $BASE_DIR/fewshot; then
+    echo "  already done — skipping"
+else
+    for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
+        CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
+        python $REPO_DIR/msaflow/inference/fold_benchmark.py \
+            --fasta           $SHALLOW_FULL_FASTA \
             --decoder_ckpt    $DECODER_CKPT \
             --latent_fm_ckpt  $LATENT_FM_CKPT \
             --output_dir      $BASE_DIR/fewshot \
