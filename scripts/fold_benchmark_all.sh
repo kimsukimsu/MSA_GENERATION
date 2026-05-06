@@ -100,6 +100,17 @@ else:
 PYEOF
 }
 
+# ── SLURM GPU 할당 파싱 ────────────────────────────────────────────────────────
+# SLURM이 CUDA_VISIBLE_DEVICES를 "1,2,3,4" 형태로 설정해 줌.
+# 스크립트가 직접 0,1,2,3을 박으면 물리 GPU 번호가 달라지므로
+# SLURM 할당 목록에서 shard 인덱스로 뽑아서 사용.
+IFS=',' read -ra SLURM_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+echo "SLURM allocated GPUs: ${SLURM_GPUS[*]}"
+
+gpu_for_shard() {
+    echo "${SLURM_GPUS[$1]}"
+}
+
 # ── 이미 완료된 stage 체크 (resume용) ─────────────────────────────────────────
 # benchmark_results.csv 가 존재하면 해당 stage 스킵.
 # 중간에 실패했을 경우: 해당 모드 디렉토리의 shard_*.csv 와
@@ -116,7 +127,7 @@ if is_done $BASE_DIR/nomsa; then
     echo "  already done — skipping (delete $BASE_DIR/nomsa/benchmark_results.csv to rerun)"
 else
     for SHARD_ID in 0 1 2 3; do
-        CUDA_VISIBLE_DEVICES=$SHARD_ID \
+        CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta          $FASTA \
             --decoder_ckpt   $LATENT_FM_CKPT \
@@ -143,7 +154,7 @@ if is_done $BASE_DIR/colabfold; then
     echo "  already done — skipping (delete $BASE_DIR/colabfold/benchmark_results.csv to rerun)"
 else
     for SHARD_ID in 0 1 2 3; do
-        CUDA_VISIBLE_DEVICES=$SHARD_ID \
+        CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta           $FASTA \
             --decoder_ckpt    $LATENT_FM_CKPT \
@@ -171,7 +182,7 @@ if is_done $BASE_DIR/zeroshot; then
     echo "  already done — skipping (delete $BASE_DIR/zeroshot/benchmark_results.csv to rerun)"
 else
     for SHARD_ID in 0 1 2 3; do
-        CUDA_VISIBLE_DEVICES=$SHARD_ID \
+        CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta          $FASTA \
             --decoder_ckpt   $DECODER_CKPT \
@@ -202,7 +213,7 @@ if is_done $BASE_DIR/fewshot; then
     echo "  already done — skipping (delete $BASE_DIR/fewshot/benchmark_results.csv to rerun)"
 else
     for SHARD_ID in 0 1 2 3; do
-        CUDA_VISIBLE_DEVICES=$SHARD_ID \
+        CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta           $FASTA \
             --decoder_ckpt    $DECODER_CKPT \
