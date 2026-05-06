@@ -213,10 +213,10 @@ class SFMDecoder(nn.Module):
         ])
 
         # Per-block conditioning projections (bias=False, checkpoint convention).
-        # Each block gets an additional block-specific MSA projection on top of
-        # the shared cond_proj, enabling depth-dependent feature extraction.
+        # Input is hidden_size (after cond_proj), not msa_dim.
+        # Each block applies its own linear to the shared MSA representation.
         self.block_cond_projs = nn.ModuleList([
-            nn.Linear(msa_dim, hidden_size, bias=False)
+            nn.Linear(hidden_size, hidden_size, bias=False)
             for _ in range(depth)
         ])
 
@@ -270,18 +270,17 @@ class SFMDecoder(nn.Module):
         # Project input sequence to hidden space + positional encoding
         h = self.input_proj(x_t) + self.pos_emb[:, :L, :]       # (B, L, H)
 
-        # Build per-position conditioning: time emb (broadcast) + shared MSA cond
+        # Build per-position conditioning
         t_emb = self.time_emb(t).unsqueeze(1).expand(B, L, -1)  # (B, L, H)
-        m_norm = self.msa_norm(m_seq)                             # (B, L, msa_dim)
-        cond_base = t_emb + self.cond_proj(m_norm)               # (B, L, H)
+        m_proj = self.cond_proj(self.msa_norm(m_seq))            # (B, L, H)
 
-        # Transformer blocks: each gets shared cond + block-specific MSA projection
+        # Each block uses its own linear transform of the shared MSA projection
         for block, block_cond_proj in zip(self.blocks, self.block_cond_projs):
-            cond = cond_base + block_cond_proj(m_norm)
+            cond = t_emb + block_cond_proj(m_proj)               # (B, L, H)
             h = block(h, cond)
 
-        # Final projection back to vocab space (use shared cond_base)
-        v = self.final_layer(h, cond_base)                       # (B, L, vocab_size)
+        # Final projection back to vocab space
+        v = self.final_layer(h, t_emb + m_proj)                  # (B, L, vocab_size)
 
         # Project onto tangent space at x_t: remove radial component
         # v_tangent = v - <v, x_t> * x_t
