@@ -46,8 +46,6 @@ N_SEEDS=${N_SEEDS:-5}
 N_STEPS=${N_STEPS:-100}
 TEMPERATURE=${TEMPERATURE:-0.5}
 MAX_REC_DEPTH=${MAX_REC_DEPTH:-128}
-NUM_SHARDS=4
-
 source $REPO_DIR/.venv/bin/activate
 export PYTHONPATH=$REPO_DIR/Protenix:$PYTHONPATH
 
@@ -100,15 +98,32 @@ else:
 PYEOF
 }
 
-# ── SLURM GPU 할당 파싱 ────────────────────────────────────────────────────────
-# SLURM이 CUDA_VISIBLE_DEVICES를 "1,2,3,4" 형태로 설정해 줌.
-# 스크립트가 직접 0,1,2,3을 박으면 물리 GPU 번호가 달라지므로
-# SLURM 할당 목록에서 shard 인덱스로 뽑아서 사용.
+# ── SLURM GPU 할당 파싱 + 불량 GPU 제거 ──────────────────────────────────────
+# SLURM이 CUDA_VISIBLE_DEVICES를 "0,1,3,4" 형태로 설정해 줌.
+# 각 GPU를 실제 CUDA 테스트로 검증하고 healthy한 것만 사용.
 IFS=',' read -ra SLURM_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 echo "SLURM allocated GPUs: ${SLURM_GPUS[*]}"
 
+HEALTHY_GPUS=()
+for _GPU in "${SLURM_GPUS[@]}"; do
+    if CUDA_VISIBLE_DEVICES=$_GPU python -c \
+        "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+        HEALTHY_GPUS+=("$_GPU")
+        echo "  GPU $_GPU: OK"
+    else
+        echo "  GPU $_GPU: CUDA init failed — skipped"
+    fi
+done
+
+if [ ${#HEALTHY_GPUS[@]} -eq 0 ]; then
+    echo "ERROR: No healthy GPUs found. Exiting."
+    exit 1
+fi
+NUM_SHARDS=${#HEALTHY_GPUS[@]}
+echo "Using GPUs: ${HEALTHY_GPUS[*]}  (NUM_SHARDS=$NUM_SHARDS)"
+
 gpu_for_shard() {
-    echo "${SLURM_GPUS[$1]}"
+    echo "${HEALTHY_GPUS[$1]}"
 }
 
 # ── 이미 완료된 stage 체크 (resume용) ─────────────────────────────────────────
@@ -126,7 +141,7 @@ echo "=== Stage 1/4: nomsa ($(date)) ==="
 if is_done $BASE_DIR/nomsa; then
     echo "  already done — skipping (delete $BASE_DIR/nomsa/benchmark_results.csv to rerun)"
 else
-    for SHARD_ID in 0 1 2 3; do
+    for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
         CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta          $FASTA \
@@ -153,7 +168,7 @@ echo "=== Stage 2/4: colabfold ($(date)) ==="
 if is_done $BASE_DIR/colabfold; then
     echo "  already done — skipping (delete $BASE_DIR/colabfold/benchmark_results.csv to rerun)"
 else
-    for SHARD_ID in 0 1 2 3; do
+    for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
         CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta           $FASTA \
@@ -181,7 +196,7 @@ echo "=== Stage 3/4: zeroshot ($(date)) ==="
 if is_done $BASE_DIR/zeroshot; then
     echo "  already done — skipping (delete $BASE_DIR/zeroshot/benchmark_results.csv to rerun)"
 else
-    for SHARD_ID in 0 1 2 3; do
+    for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
         CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta          $FASTA \
@@ -212,7 +227,7 @@ echo "=== Stage 4/4: fewshot ($(date)) ==="
 if is_done $BASE_DIR/fewshot; then
     echo "  already done — skipping (delete $BASE_DIR/fewshot/benchmark_results.csv to rerun)"
 else
-    for SHARD_ID in 0 1 2 3; do
+    for SHARD_ID in $(seq 0 $((NUM_SHARDS-1))); do
         CUDA_VISIBLE_DEVICES=$(gpu_for_shard $SHARD_ID) \
         python $REPO_DIR/msaflow/inference/fold_benchmark.py \
             --fasta           $FASTA \
