@@ -125,7 +125,10 @@ class PosWiseAdaLNBlock(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class FinalLayer(nn.Module):
-    """Final position-wise AdaLN + linear output layer."""
+    """Final position-wise AdaLN + linear output layer.
+
+    Uses 3-way modulation (shift, scale, gate) to match the trained checkpoint.
+    """
 
     def __init__(self, hidden_size: int, out_dim: int):
         super().__init__()
@@ -133,7 +136,7 @@ class FinalLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, out_dim)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size),
+            nn.Linear(hidden_size, 3 * hidden_size),
         )
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
@@ -142,9 +145,9 @@ class FinalLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """x, c: (B, L, H) → (B, L, out_dim)."""
-        mod = self.adaLN_modulation(c)          # (B, L, 2*H)
-        shift, scale = mod.chunk(2, dim=-1)
-        x = modulate_poswise(self.norm(x), shift, scale)
+        mod = self.adaLN_modulation(c)          # (B, L, 3*H)
+        shift, scale, gate = mod.chunk(3, dim=-1)
+        x = gate * modulate_poswise(self.norm(x), shift, scale)
         return self.linear(x)
 
 
@@ -199,14 +202,21 @@ class SFMDecoder(nn.Module):
 
         # ── Conditioning projection (per-residue MSA emb → hidden) ────────────
         # LayerNorm normalises AF3 MSA embeddings (std >> 1) before projection.
-        # Without it ∂L/∂W_cond inherits m_seq scale → cond_proj dominates
-        # total grad_norm and forces an effectively near-zero LR after clipping.
-        self.msa_norm = nn.LayerNorm(msa_dim)
+        # bias=False to match trained checkpoint.
+        self.msa_norm = nn.LayerNorm(msa_dim, bias=False)
         self.cond_proj = nn.Linear(msa_dim, hidden_size)
 
         # ── Transformer blocks ────────────────────────────────────────────────
         self.blocks = nn.ModuleList([
             PosWiseAdaLNBlock(hidden_size, num_heads, mlp_ratio)
+            for _ in range(depth)
+        ])
+
+        # Per-block conditioning projections (bias=False, checkpoint convention).
+        # Each block gets an additional block-specific MSA projection on top of
+        # the shared cond_proj, enabling depth-dependent feature extraction.
+        self.block_cond_projs = nn.ModuleList([
+            nn.Linear(msa_dim, hidden_size, bias=False)
             for _ in range(depth)
         ])
 
@@ -260,16 +270,18 @@ class SFMDecoder(nn.Module):
         # Project input sequence to hidden space + positional encoding
         h = self.input_proj(x_t) + self.pos_emb[:, :L, :]       # (B, L, H)
 
-        # Build per-position conditioning: time emb (broadcast) + MSA cond
+        # Build per-position conditioning: time emb (broadcast) + shared MSA cond
         t_emb = self.time_emb(t).unsqueeze(1).expand(B, L, -1)  # (B, L, H)
-        cond = t_emb + self.cond_proj(self.msa_norm(m_seq))      # (B, L, H)
+        m_norm = self.msa_norm(m_seq)                             # (B, L, msa_dim)
+        cond_base = t_emb + self.cond_proj(m_norm)               # (B, L, H)
 
-        # Transformer blocks with position-wise AdaLN
-        for block in self.blocks:
+        # Transformer blocks: each gets shared cond + block-specific MSA projection
+        for block, block_cond_proj in zip(self.blocks, self.block_cond_projs):
+            cond = cond_base + block_cond_proj(m_norm)
             h = block(h, cond)
 
-        # Final projection back to vocab space
-        v = self.final_layer(h, cond)                            # (B, L, vocab_size)
+        # Final projection back to vocab space (use shared cond_base)
+        v = self.final_layer(h, cond_base)                       # (B, L, vocab_size)
 
         # Project onto tangent space at x_t: remove radial component
         # v_tangent = v - <v, x_t> * x_t
