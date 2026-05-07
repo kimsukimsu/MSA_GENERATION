@@ -26,6 +26,18 @@ import torch.nn.functional as F
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (no mean centering, learnable scale)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return (x.float() / rms * self.weight).to(x.dtype)
+
 class SinusoidalTimeEmbedding(nn.Module):
     """Sinusoidal time embedding → MLP, output dim = hidden_size."""
 
@@ -45,7 +57,7 @@ class SinusoidalTimeEmbedding(nn.Module):
             -math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half
         )
         args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)   # (B, half)
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         if dim % 2:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
         return emb
@@ -125,10 +137,7 @@ class PosWiseAdaLNBlock(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class FinalLayer(nn.Module):
-    """Final position-wise AdaLN + linear output layer.
-
-    Uses 3-way modulation (shift, scale, gate) to match the trained checkpoint.
-    """
+    """Final position-wise AdaLN + linear output layer."""
 
     def __init__(self, hidden_size: int, out_dim: int):
         super().__init__()
@@ -144,11 +153,13 @@ class FinalLayer(nn.Module):
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """x, c: (B, L, H) → (B, L, out_dim)."""
-        mod = self.adaLN_modulation(c)          # (B, L, 3*H)
+        mod = self.adaLN_modulation(c)          # (B, L, 3H)
         shift, scale, gate = mod.chunk(3, dim=-1)
-        x = gate * modulate_poswise(self.norm(x), shift, scale)
-        return self.linear(x)
+
+        x = modulate_poswise(self.norm(x), shift, scale)  # (B, L, H)
+        x = gate * x
+
+        return self.linear(x)  # (B, L, out_dim)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -201,9 +212,11 @@ class SFMDecoder(nn.Module):
         self.time_emb = SinusoidalTimeEmbedding(hidden_size)
 
         # ── Conditioning projection (per-residue MSA emb → hidden) ────────────
-        # LayerNorm normalises AF3 MSA embeddings (std >> 1) before projection.
-        # bias=False to match trained checkpoint.
-        self.msa_norm = nn.LayerNorm(msa_dim, bias=False)
+        # RMSNorm normalises AF3 MSA embeddings (std >> 1) before projection.
+        # Without it ∂L/∂W_cond inherits m_seq scale → cond_proj dominates
+        # total grad_norm and forces an effectively near-zero LR after clipping.
+        # RMSNorm preferred over LayerNorm: no mean-centering, stable on sparse inputs.
+        self.msa_norm = RMSNorm(msa_dim)
         self.cond_proj = nn.Linear(msa_dim, hidden_size)
 
         # ── Transformer blocks ────────────────────────────────────────────────
@@ -212,9 +225,9 @@ class SFMDecoder(nn.Module):
             for _ in range(depth)
         ])
 
-        # Per-block conditioning projections (bias=False, checkpoint convention).
-        # Input is hidden_size (after cond_proj), not msa_dim.
-        # Each block applies its own linear to the shared MSA representation.
+        # Per-block conditioning offsets: each block gets a residual on the
+        # shared cond vector, allowing the network to route different conditioning
+        # signals to different layers. Zero-inited → identity at init.
         self.block_cond_projs = nn.ModuleList([
             nn.Linear(hidden_size, hidden_size, bias=False)
             for _ in range(depth)
@@ -237,6 +250,9 @@ class SFMDecoder(nn.Module):
         # Time MLP
         nn.init.normal_(self.time_emb.mlp[0].weight, std=0.02)
         nn.init.normal_(self.time_emb.mlp[2].weight, std=0.02)
+        # block_cond_projs: zero-init so blocks start as identity conditioning
+        for proj in self.block_cond_projs:
+            nn.init.zeros_(proj.weight)
 
     @staticmethod
     def _build_sincos_pos_emb(max_len: int, dim: int) -> torch.Tensor:
@@ -270,17 +286,16 @@ class SFMDecoder(nn.Module):
         # Project input sequence to hidden space + positional encoding
         h = self.input_proj(x_t) + self.pos_emb[:, :L, :]       # (B, L, H)
 
-        # Build per-position conditioning
+        # Build per-position conditioning: time emb (broadcast) + MSA cond
         t_emb = self.time_emb(t).unsqueeze(1).expand(B, L, -1)  # (B, L, H)
-        m_proj = self.cond_proj(self.msa_norm(m_seq))            # (B, L, H)
+        cond = t_emb + self.cond_proj(self.msa_norm(m_seq))      # (B, L, H)
 
-        # Each block uses its own linear transform of the shared MSA projection
-        for block, block_cond_proj in zip(self.blocks, self.block_cond_projs):
-            cond = t_emb + block_cond_proj(m_proj)               # (B, L, H)
-            h = block(h, cond)
+        # Transformer blocks with position-wise AdaLN
+        for block, cond_proj in zip(self.blocks, self.block_cond_projs):
+            h = block(h, cond + cond_proj(cond))
 
         # Final projection back to vocab space
-        v = self.final_layer(h, t_emb + m_proj)                  # (B, L, vocab_size)
+        v = self.final_layer(h, cond)                            # (B, L, vocab_size)
 
         # Project onto tangent space at x_t: remove radial component
         # v_tangent = v - <v, x_t> * x_t
@@ -359,6 +374,9 @@ def sfm_loss(
 
     x_t = geodesic_interpolate(x0, x1, t_bcast, eps=eps)      # (B, L, V) float32
     u_t = target_velocity(x_t, x1, t_bcast, eps=eps)          # (B, L, V) float32
+    # Ensure u_t is exactly in tangent space at x_t (fp32 log_map can leak a
+    # tiny radial component; projecting out removes that training noise).
+    u_t = u_t - (u_t * x_t).sum(dim=-1, keepdim=True) * x_t  # (B, L, V)
 
     # Predicted velocity (may be bfloat16 under Accelerate autocast)
     v_pred = model(x_t, m_seq, t)                              # (B, L, V)
@@ -376,11 +394,17 @@ def sfm_loss(
         # weights: (B,) — down-weight redundant sequences via Neff reweighting
         loss = loss * weights.unsqueeze(1)                     # (B, L)
 
-    # Normalise by the number of real (non-padded) positions so the loss scale
-    # stays invariant to sequence length and batch composition.
-    # When padding_mask is None every position is real, so this equals loss.mean().
+    # Normalise so that the loss scale stays invariant to sequence length,
+    # batch composition, and Neff weighting.
+    # n_real = effective count of (weight × position) contributions.
     if padding_mask is not None:
-        n_real = padding_mask.float().sum().clamp(min=1.0)
+        if weights is not None:
+            n_real = (weights.unsqueeze(1) * padding_mask.float()).sum().clamp(min=1.0)
+        else:
+            n_real = padding_mask.float().sum().clamp(min=1.0)
     else:
-        n_real = loss.numel()
+        if weights is not None:
+            n_real = weights.sum().clamp(min=1.0) * L
+        else:
+            n_real = float(B * L)
     return loss.sum() / n_real
