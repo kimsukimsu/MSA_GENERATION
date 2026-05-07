@@ -397,7 +397,7 @@ def fold_once(
         input_json=str(json_path),
         output_dir=str(protenix_out_dir),
         model_name=args.protenix_model,
-        use_msa=use_msa,
+        use_msa=use_msa and (valid_a3m is not None),
     )
     if result.returncode != 0:
         logger.error("  Protenix failed (exit %d) for %s", result.returncode, run_name)
