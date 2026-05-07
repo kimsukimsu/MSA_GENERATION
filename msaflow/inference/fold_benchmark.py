@@ -107,6 +107,59 @@ def _a3m_query_length(a3m_path: Path) -> Optional[int]:
         return None
 
 
+def _trim_a3m(a3m_path: Path, query_seq: str) -> Optional[str]:
+    """Trim A3M columns to match query_seq.
+
+    Finds query_seq as a contiguous substring in the A3M's first (query)
+    sequence (uppercase letters only), then extracts those columns from all
+    sequences. Returns a trimmed A3M string, or None if not found.
+    """
+    try:
+        content = a3m_path.read_text()
+    except Exception:
+        return None
+
+    records: list[tuple[str, str]] = []
+    header, seq_parts = None, []
+    for line in content.splitlines():
+        if line.startswith(">"):
+            if header is not None:
+                records.append((header, "".join(seq_parts)))
+            header, seq_parts = line, []
+        else:
+            seq_parts.append(line)
+    if header is not None:
+        records.append((header, "".join(seq_parts)))
+
+    if not records:
+        return None
+
+    a3m_query_upper = re.sub(r"[a-z]", "", records[0][1])
+    start = a3m_query_upper.find(query_seq)
+    if start == -1:
+        return None
+    end = start + len(query_seq)
+
+    def _extract(seq: str) -> str:
+        out, col, in_range = [], 0, False
+        for ch in seq:
+            if ch.isupper() or ch == "-":
+                in_range = start <= col < end
+                if in_range:
+                    out.append(ch)
+                col += 1
+            else:  # lowercase insertion
+                if in_range:
+                    out.append(ch)
+        return "".join(out)
+
+    lines = []
+    for hdr, seq in records:
+        lines.append(hdr)
+        lines.append(_extract(seq))
+    return "\n".join(lines) + "\n"
+
+
 def parse_a3m_seqs(path: str) -> list[str]:
     """Read sequences from an A3M file (first entry = query, rest = hits)."""
     seqs = []
@@ -371,10 +424,20 @@ def fold_once(
         if a3m_qlen is None or a3m_qlen == len(query_seq):
             valid_a3m = str(a3m_path)
         else:
-            logger.warning(
-                "A3M query length %d ≠ seq length %d for %s — folding without MSA",
-                a3m_qlen, len(query_seq), prot_name,
-            )
+            trimmed = _trim_a3m(a3m_path, query_seq)
+            if trimmed is not None:
+                trimmed_path = run_dir / f"{run_name}_trimmed.a3m"
+                trimmed_path.write_text(trimmed)
+                valid_a3m = str(trimmed_path)
+                logger.info(
+                    "  A3M trimmed %d→%d aa for %s",
+                    a3m_qlen, len(query_seq), prot_name,
+                )
+            else:
+                logger.warning(
+                    "A3M query length %d ≠ seq length %d for %s — FASTA not substring of A3M, folding without MSA",
+                    a3m_qlen, len(query_seq), prot_name,
+                )
 
     task = build_protenix_json(
         name=run_name,

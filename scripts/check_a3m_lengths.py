@@ -47,11 +47,10 @@ def find_a3m(msa_dir: Path, prot_name: str):
     return None
 
 
-def a3m_query_length(a3m_path: Path):
+def a3m_query_upper(a3m_path: Path) -> str:
+    parts, in_seq = [], False
     try:
         with open(a3m_path) as fh:
-            in_seq = False
-            parts = []
             for line in fh:
                 line = line.rstrip()
                 if line.startswith(">"):
@@ -60,9 +59,9 @@ def a3m_query_length(a3m_path: Path):
                     in_seq = True
                 elif in_seq:
                     parts.append(re.sub(r"[a-z]", "", line))
-        return len("".join(parts)) if parts else None
     except Exception:
-        return None
+        pass
+    return "".join(parts)
 
 
 def main():
@@ -74,37 +73,41 @@ def main():
     proteins = parse_fasta(args.fasta)
     msa_dir  = Path(args.msa_dir)
 
-    total      = len(proteins)
-    no_a3m     = []
-    mismatch   = []
-    ok         = []
+    no_a3m    = []
+    ok        = []
+    trimmable = []
+    no_trim   = []
 
     for name, seq in proteins:
         a3m = find_a3m(msa_dir, name)
         if a3m is None:
             no_a3m.append(name)
             continue
-        ql = a3m_query_length(a3m)
-        if ql is None or ql != len(seq):
-            mismatch.append((name, len(seq), ql, a3m.name))
-        else:
+        query = a3m_query_upper(a3m)
+        if len(query) == len(seq):
             ok.append(name)
+        elif seq in query:
+            trimmable.append((name, len(seq), len(query), a3m.name))
+        else:
+            no_trim.append((name, len(seq), len(query), a3m.name))
 
-    print(f"\nTotal proteins : {total}")
-    print(f"A3M found + OK : {len(ok)}")
-    print(f"A3M not found  : {len(no_a3m)}")
-    print(f"Length mismatch: {len(mismatch)}")
+    total = len(proteins)
+    print(f"\nTotal proteins   : {total}")
+    print(f"A3M OK (exact)   : {len(ok)}")
+    print(f"Trimmable        : {len(trimmable)}")
+    print(f"Not trimmable    : {len(no_trim)}  ← will fold without MSA")
+    print(f"A3M not found    : {len(no_a3m)}")
+
+    if no_trim:
+        print("\n── Not trimmable (FASTA not substring of A3M query) ──")
+        print(f"  {'protein':<30} {'seq':>6} {'a3m':>6}  file")
+        for name, slen, ql, fname in no_trim:
+            print(f"  {name:<30} {slen:>6} {ql:>6}  {fname}")
 
     if no_a3m:
         print("\n── No A3M file ──")
         for n in no_a3m:
             print(f"  {n}")
-
-    if mismatch:
-        print("\n── Length mismatch ──")
-        print(f"  {'protein':<30} {'seq':>6} {'a3m':>6}  file")
-        for name, slen, ql, fname in mismatch:
-            print(f"  {name:<30} {slen:>6} {ql!s:>6}  {fname}")
 
     print()
 
