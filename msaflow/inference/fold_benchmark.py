@@ -53,6 +53,7 @@ import csv
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -85,6 +86,25 @@ def parse_fasta(path: str) -> list[tuple[str, str]]:
     if name is not None:
         results.append((name, "".join(buf)))
     return results
+
+
+def _a3m_query_length(a3m_path: Path) -> Optional[int]:
+    """Return the uppercase-only length of the first sequence in an A3M file."""
+    try:
+        with open(a3m_path) as fh:
+            in_seq = False
+            parts = []
+            for line in fh:
+                line = line.rstrip()
+                if line.startswith(">"):
+                    if in_seq:
+                        break
+                    in_seq = True
+                elif in_seq:
+                    parts.append(re.sub(r"[a-z]", "", line))
+        return len("".join(parts)) if parts else None
+    except Exception:
+        return None
 
 
 def parse_a3m_seqs(path: str) -> list[str]:
@@ -155,7 +175,6 @@ def build_protenix_json(
     protein_chain: dict = {"sequence": query_seq, "count": 1}
     if msa_a3m_path is not None:
         protein_chain["unpairedMsaPath"] = str(msa_a3m_path)
-        protein_chain["pairedMsaPath"] = str(msa_a3m_path)
 
     return {
         "name": name,
@@ -346,10 +365,21 @@ def fold_once(
     run_dir = fold_dir / run_name
     run_dir.mkdir(exist_ok=True)
 
+    valid_a3m: Optional[str] = None
+    if a3m_path is not None and a3m_path.exists():
+        a3m_qlen = _a3m_query_length(a3m_path)
+        if a3m_qlen is None or a3m_qlen == len(query_seq):
+            valid_a3m = str(a3m_path)
+        else:
+            logger.warning(
+                "A3M query length %d ≠ seq length %d for %s — folding without MSA",
+                a3m_qlen, len(query_seq), prot_name,
+            )
+
     task = build_protenix_json(
         name=run_name,
         query_seq=query_seq,
-        msa_a3m_path=str(a3m_path) if (a3m_path is not None and a3m_path.exists()) else None,
+        msa_a3m_path=valid_a3m,
     )
     json_path = run_dir / f"{run_name}_input.json"
     with open(json_path, "w") as fh:
